@@ -66,13 +66,35 @@ function M.check()
     ok("Terminal multiplexer integration is disabled")
   end
 
-  for _, mux in ipairs({ "tmux", "zellij" }) do
-    if vim.fn.executable(mux) == 1 then
+  local herdr = require("sidekick.cli.session.herdr")
+  for _, mux in ipairs({ "tmux", "zellij", "herdr" }) do
+    -- herdr is resolved through `$HERDR_BIN_PATH` when set (D17)
+    local exe = mux == "herdr" and herdr.bin() or mux
+    if vim.fn.executable(exe) == 1 then
       ok("`" .. mux .. "` is installed")
     elseif mux == Config.cli.mux.backend then
       error("Multiplexer backend `" .. mux .. "` is not installed")
     else
       ok("`" .. mux .. "` is not installed, but it's not the configured backend")
+    end
+  end
+
+  if vim.fn.executable(herdr.bin()) == 1 then
+    local status = herdr.status()
+    -- A down server still returns exit code 0 with `{ running = false }`,
+    -- so only a truthy `running` flag means the server is actually up (D18).
+    if status ~= nil and status.running == true then
+      local details = {}
+      if status.version ~= nil and status.version ~= vim.NIL then
+        details[#details + 1] = ("version `%s`"):format(status.version)
+      end
+      if status.protocol ~= nil and status.protocol ~= vim.NIL then
+        details[#details + 1] = ("protocol `%s`"):format(status.protocol)
+      end
+      local suffix = #details > 0 and (" (" .. table.concat(details, ", ") .. ")") or ""
+      ok("herdr server is running" .. suffix)
+    else
+      warn("herdr server is not running")
     end
   end
 
