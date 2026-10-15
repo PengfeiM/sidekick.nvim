@@ -4,6 +4,7 @@ local M = {}
 
 local start = vim.health.start or vim.health.report_start
 local ok = vim.health.ok or vim.health.report_ok
+local info = vim.health.info or vim.health.report_info
 local warn = vim.health.warn or vim.health.report_warn
 local error = vim.health.error or vim.health.report_error
 
@@ -71,7 +72,7 @@ function M.check()
     -- herdr is resolved through `$HERDR_BIN_PATH` when set (D17)
     local exe = mux == "herdr" and herdr.bin() or mux
     if vim.fn.executable(exe) == 1 then
-      ok("`" .. mux .. "` is installed")
+      ok(("`%s` is installed"):format(exe))
     elseif mux == Config.cli.mux.backend then
       error("Multiplexer backend `" .. mux .. "` is not installed")
     else
@@ -95,6 +96,16 @@ function M.check()
       ok("herdr server is running" .. suffix)
     else
       warn("herdr server is not running")
+    end
+    -- R17: herdr exposes no absolute pane focus (`pane focus` is directional-only),
+    -- so focusing a session can only reveal the pane's workspace and its tab.
+    info(
+      "herdr has no absolute pane focus (`pane focus` is directional-only); focusing a session reveals the pane's workspace and tab, but not the split within the tab"
+    )
+    -- herdr servers are per-session; only the default session can be probed here.
+    info("herdr servers are per-session; the server status above only reflects the default session")
+    if vim.fn.has("win32") == 1 then
+      info("herdr `terminal attach` is only supported on Linux/macOS; embedded terminals are unavailable on Windows")
     end
   end
 

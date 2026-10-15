@@ -244,6 +244,15 @@ function M:pane(refresh)
   if match then
     self.herdr_pane_id = match.pane_id or match.id
     self.herdr_terminal_id = match.terminal_id
+    -- The matched pane carries the location that a create/split payload may have
+    -- omitted (the same guarded capture as `launch_pane`); remember it here so a
+    -- later lookup can still recover the tab and reveal it (F3).
+    if match.workspace_id then
+      self.herdr_workspace_id = self.herdr_workspace_id or match.workspace_id
+    end
+    if match.tab_id then
+      self.herdr_tab_id = self.herdr_tab_id or match.tab_id
+    end
     return match
   end
   -- D18: a failed lookup invalidates the cached identity so `is_running()`
@@ -269,8 +278,8 @@ end
 ---absolute primitives are `workspace focus <id>` and `tab focus <id>`, so
 ---sidekick brings the pane's workspace and then its tab forward. The pane
 ---becomes visible, but intra-tab split focus is not set.
----Best effort: returns `self` without spawning anything when no location can be
----resolved.
+---Best effort: returns `self` without running any focus command when no location
+---can be resolved (a cold cache may still run one `pane list` lookup).
 ---@return sidekick.cli.Session
 function M:focus()
   local pane = self:pane()
@@ -640,6 +649,16 @@ function M:start()
     local ret = M.json(cmd, { notify = true })
     local pane = ret and ret.root_pane
     if not pane or not self:launch_pane(pane) then
+      -- R16: this workspace was created by us for the embedded terminal, so it
+      -- must not outlive a failed launch. Best-effort, silent close (the failure
+      -- is already reported by `Util.error`); skipped defensively when the create
+      -- payload carried no workspace id. The `window`/`split` branches below never
+      -- do this: they open into the user's *existing* workspace, which must be
+      -- left alone.
+      local ws = ret and ret.workspace and ret.workspace.workspace_id
+      if ws then
+        Util.exec(M.cmd(self.herdr_session, { "workspace", "close", ws }, current), { notify = false })
+      end
       return nil
     end
     return {

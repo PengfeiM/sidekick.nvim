@@ -83,6 +83,9 @@ local defaults = {
     },
     ---@class sidekick.cli.Mux
     ---@field backend? "tmux"|"zellij"|"herdr" Multiplexer backend to persist CLI sessions
+    --- NOTE: herdr has no absolute pane focus (`pane focus` is directional-only),
+    --- so focusing a session reveals the pane's workspace and tab,
+    --- but not the split within the tab.
     mux = {
       backend = vim.env.HERDR_ENV == "1" and "herdr" or vim.env.ZELLIJ and "zellij" or "tmux", -- detect the running mux
       enabled = false,

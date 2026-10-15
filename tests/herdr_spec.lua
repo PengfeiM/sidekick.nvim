@@ -670,7 +670,7 @@ describe("herdr backend", function()
       assert.are.same({ "herdr", "--session", "sess", "tab", "focus", "w1:t1" }, calls[2])
     end)
 
-    it("omits --session for external sessions", function()
+    it("omits --session for the current (session-less) source", function()
       vim.env.HERDR_BIN_PATH = "herdr"
       local s = tool_session({ external = true, herdr_pane_id = "w7:p1", herdr_terminal_id = "t7" })
       local calls = stub_herdr(function()
@@ -691,9 +691,10 @@ describe("herdr backend", function()
       assert.are.same({ "herdr", "--session", "sess", "pane", "list" }, calls[1])
     end)
 
-    it("spawns nothing when no location can be resolved", function()
-      -- not external and no herdr session: `pane()` cannot even list panes, so
-      -- the best-effort reveal returns without spawning any herdr command
+    it("spawns nothing when pane() has no source to list (early return)", function()
+      -- not external and no herdr session: `pane()` returns early before listing
+      -- panes, so the best-effort reveal spawns no herdr command. Note this entry
+      -- state is only reachable directly; `init()` always assigns a `herdr_session`.
       local s = new_session({ sid = "sid", cwd = "/tmp/cwd" })
       Util.exec = function()
         error("focus must not spawn when no location can be resolved")
@@ -808,6 +809,34 @@ describe("herdr backend", function()
       assert.are.equal("t1", s:pane().terminal_id)
       assert.are.equal("t1", s.herdr_terminal_id)
       assert.are.equal("w1:p1", s:pane_id())
+    end)
+
+    it("backfills a missing workspace/tab from the matched pane (F3)", function()
+      vim.env.HERDR_BIN_PATH = "herdr"
+      local s = tool_session({ herdr_terminal_id = "t1" })
+      stub_herdr(function()
+        return '{"id":"1","result":{"panes":[{"pane_id":"w1:p1","terminal_id":"t1",'
+          .. '"workspace_id":"w1","tab_id":"w1:t1"}]}}'
+      end)
+      assert.is_true(s:pane() ~= nil)
+      assert.are.equal("w1", s.herdr_workspace_id)
+      assert.are.equal("w1:t1", s.herdr_tab_id)
+    end)
+
+    it("keeps an already known workspace/tab over the pane record (F3)", function()
+      vim.env.HERDR_BIN_PATH = "herdr"
+      local s = tool_session({
+        herdr_terminal_id = "t1",
+        herdr_workspace_id = "w9",
+        herdr_tab_id = "w9:t9",
+      })
+      stub_herdr(function()
+        return '{"id":"1","result":{"panes":[{"pane_id":"w1:p1","terminal_id":"t1",'
+          .. '"workspace_id":"w1","tab_id":"w1:t1"}]}}'
+      end)
+      assert.is_true(s:pane() ~= nil)
+      assert.are.equal("w9", s.herdr_workspace_id)
+      assert.are.equal("w9:t9", s.herdr_tab_id)
     end)
 
     it("returns nil when no pane matches", function()
@@ -942,6 +971,33 @@ describe("herdr backend", function()
       end)
       assert.is_nil(s:start())
     end)
+
+    it("closes the workspace it created when the launch fails (R16)", function()
+      vim.env.HERDR_BIN_PATH = "herdr"
+      Config.cli.mux.create = "terminal"
+      Util.error = function() end
+      vim.wait = function() end
+      local s = tool_session()
+      local calls = stub_herdr(function(cmd)
+        if vim.tbl_contains(cmd, "status") then
+          return '{"running":true}'
+        elseif vim.tbl_contains(cmd, "workspace") then
+          return '{"id":"1","result":{"workspace":{"workspace_id":"w2"},'
+            .. '"root_pane":{"pane_id":"w2:p1","terminal_id":"t2"}}}'
+        elseif vim.tbl_contains(cmd, "process-info") then
+          return NO_PROC -- the tool never comes up: launch fails
+        end
+        return "" -- pane run accepted
+      end)
+      assert.is_nil(s:start())
+      assert.is_nil(s.started)
+      assert.is_nil(s.herdr_pane_id)
+      assert.is_nil(s.herdr_terminal_id)
+      assert.are.same(
+        { "herdr", "--session", "sess", "workspace", "close", "w2" },
+        find_call(calls, { "workspace", "close" })
+      )
+    end)
   end)
 
   describe("start() window (create = window)", function()
@@ -1002,6 +1058,26 @@ describe("herdr backend", function()
         "sid",
         "--no-focus",
       }, find_call(calls, { "tab", "create" }))
+    end)
+
+    it("does not close the user's workspace when the launch fails (R16)", function()
+      vim.env.HERDR_WORKSPACE_ID = "w7"
+      Config.cli.mux.create = "window"
+      Util.error = function() end
+      vim.wait = function() end
+      local s = tool_session({ external = true })
+      local calls = stub_herdr(function(cmd)
+        if vim.tbl_contains(cmd, "tab") then
+          return '{"id":"1","result":{"root_pane":{"pane_id":"w7:p9","terminal_id":"t9"}}}'
+        elseif vim.tbl_contains(cmd, "process-info") then
+          return NO_PROC -- the tool never comes up: launch fails
+        end
+        return ""
+      end)
+      assert.is_nil(s:start())
+      -- only the pane we opened is closed; the pre-existing workspace is left alone
+      assert.are.same({ "herdr", "pane", "close", "w7:p9" }, calls[#calls])
+      assert.is_nil(find_call(calls, { "workspace", "close" }))
     end)
   end)
 
