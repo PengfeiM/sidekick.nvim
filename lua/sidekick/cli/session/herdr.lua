@@ -2,9 +2,12 @@ local Config = require("sidekick.config")
 local Util = require("sidekick.util")
 
 ---@class sidekick.cli.muxer.Herdr: sidekick.cli.Session
----@field herdr_session? string sanitized herdr session name (never stored in `mux_session`)
+---@field herdr_session? string herdr session name (discovered source name or sanitized sid; never stored in `mux_session`)
+---@field herdr_current? boolean target the current (session-less) server
 ---@field herdr_pane_id? string
 ---@field herdr_terminal_id? string
+---@field herdr_workspace_id? string
+---@field herdr_tab_id? string
 local M = {}
 M.__index = M
 M.priority = 50
@@ -226,7 +229,7 @@ function M:pane(refresh)
   if not self.external and not self.herdr_session then
     return nil
   end
-  local ret = M.json(M.cmd(self.herdr_session, { "pane", "list" }, self.external == true))
+  local ret = M.json(M.cmd(self.herdr_session, { "pane", "list" }, self.herdr_current == true))
   local match ---@type table?
   for _, pane in ipairs(panes(ret)) do
     local pane_id = pane.pane_id or pane.id
@@ -258,6 +261,34 @@ function M:pane_id()
   end
   local pane = self:pane()
   return pane and (pane.pane_id or pane.id) or nil
+end
+
+---Reveal the pane backing this session (D9, revised).
+---herdr exposes **no absolute pane focus**: `pane focus` is directional-only
+---(`--direction left|right|up|down`) and moves to a *neighbor*. The only
+---absolute primitives are `workspace focus <id>` and `tab focus <id>`, so
+---sidekick brings the pane's workspace and then its tab forward. The pane
+---becomes visible, but intra-tab split focus is not set.
+---Best effort: returns `self` without spawning anything when no location can be
+---resolved.
+---@return sidekick.cli.Session
+function M:focus()
+  local pane = self:pane()
+  local pane_id = self.herdr_pane_id or (pane and (pane.pane_id or pane.id))
+  local ws = self.herdr_workspace_id or (pane and pane.workspace_id) or (pane_id and pane_id:match("^([^:]+):"))
+  -- best effort: nothing to reveal when neither a pane nor a workspace resolved
+  if not pane and not ws then
+    return self
+  end
+  local session, current = self.herdr_session, self.herdr_current == true
+  if ws then
+    Util.exec(M.cmd(session, { "workspace", "focus", ws }, current), { notify = true })
+  end
+  local tab = self.herdr_tab_id or (pane and pane.tab_id)
+  if tab then
+    Util.exec(M.cmd(session, { "tab", "focus", tab }, current), { notify = true })
+  end
+  return self
 end
 
 ---Warn once per session when an embedded terminal would nest inside herdr (D6).
@@ -298,7 +329,8 @@ end
 ---@param pane_id string
 ---@return boolean
 function M:proc_running(pane_id)
-  local ret = M.json(M.cmd(self.herdr_session, { "pane", "process-info", "--pane", pane_id }, self.external == true))
+  local ret =
+    M.json(M.cmd(self.herdr_session, { "pane", "process-info", "--pane", pane_id }, self.herdr_current == true))
   local info = type(ret) == "table" and ret.process_info or nil
   if type(info) ~= "table" then
     return false
@@ -341,7 +373,7 @@ function M:launch_pane(pane)
   if not pane_id then
     return false
   end
-  local session, current = self.herdr_session, self.external == true
+  local session, current = self.herdr_session, self.herdr_current == true
   local tool_cmd = table.concat(
     vim.tbl_map(function(a)
       return vim.fn.shellescape(a)
@@ -353,6 +385,14 @@ function M:launch_pane(pane)
     if Util.exec(cmd, { notify = false }) and self:wait_proc(pane_id) then
       self.herdr_pane_id = pane_id
       self.herdr_terminal_id = pane.terminal_id
+      -- location is optional on create/split responses (D9 reveal); only
+      -- overwrite when the payload actually carries it
+      if pane.workspace_id then
+        self.herdr_workspace_id = pane.workspace_id
+      end
+      if pane.tab_id then
+        self.herdr_tab_id = pane.tab_id
+      end
       self.started = true
       return true
     end
@@ -369,9 +409,12 @@ function M:launch_pane(pane)
 end
 
 ---Initialize the session backend.
----Mirrors the tmux semantics (D14). The sanitized name is stored in
----`self.herdr_session` and is *never* written to `self.mux_session`,
----otherwise every embedded session would be treated as external.
+---Mirrors the tmux semantics (D14). Discovered states already carry their
+---source identity (`herdr_session` / `herdr_current` / `mux_session`), so they
+---are never clobbered here; the sanitized `session_name(sid)` is only the
+---fallback for sessions created by Neovim. The sanitized name is *never*
+---written to `self.mux_session`, otherwise every embedded session would be
+---treated as external.
 function M:init()
   if self.started then
     self.external = self.sid ~= self.mux_session
@@ -379,22 +422,207 @@ function M:init()
     self.external = vim.env.HERDR_ENV == "1" and Config.cli.mux.create ~= "terminal"
     self.mux_session = self.sid
   end
-  self.herdr_session = M.session_name(self.sid)
+  self.herdr_session = self.herdr_session or M.session_name(self.sid)
+  if self.herdr_current == nil then
+    self.herdr_current = self.external == true
+  end
   self.priority = self.external and 10 or 50
   self:nested_warn()
 end
 
----List all active sessions for this backend (discovery: P3).
+---@class sidekick.cli.session.HerdrSource
+---@field name? string herdr session name (`nil` for the implicit current session)
+---@field current boolean query the current (session-less) server
+
+---List the session sources to scan for running tools (D8/D16).
+---Includes the current (session-less) server when running inside herdr, plus
+---every running named session from `session list`. Sources are deduplicated by
+---name so the current session cannot be scanned twice when it is also reported
+---by `session list` (D16).
+---@return sidekick.cli.session.HerdrSource[]
+function M.sources()
+  local ret = {} ---@type sidekick.cli.session.HerdrSource[]
+  local seen = {} ---@type table<string, boolean>
+
+  local named = {} ---@type table[]
+  local list = M.json({ M.bin(), "session", "list", "--json" })
+  if type(list) == "table" and type(list.sessions) == "table" then
+    named = list.sessions
+  end
+
+  ---@param name? string
+  ---@param current boolean
+  local function add(name, current)
+    local key = name or "\0current"
+    if seen[key] then
+      return
+    end
+    seen[key] = true
+    ret[#ret + 1] = { name = name, current = current }
+  end
+
+  if vim.env.HERDR_ENV == "1" or vim.env.HERDR_SOCKET_PATH then
+    -- Resolve the current session's name so the matching entry from
+    -- `session list` is deduplicated (D16).
+    local name
+    for _, s in ipairs(named) do
+      if vim.env.HERDR_SOCKET_PATH and s.socket_path == vim.env.HERDR_SOCKET_PATH then
+        name = s.name
+        break
+      end
+    end
+    if not name then
+      for _, s in ipairs(named) do
+        if s.default then
+          name = s.name
+          break
+        end
+      end
+    end
+    add(name, true)
+  end
+
+  for _, s in ipairs(named) do
+    if s.running and s.name then
+      add(s.name, false)
+    end
+  end
+
+  return ret
+end
+
+---List all active sessions for this backend (discovery: D8/D16).
+---For every source, lists its panes and inspects each pane's foreground
+---processes, matching them against the configured tools. Emits one state per
+---matching pane, deduplicated by `terminal_id` (a duplicate id would hit the
+---`assert` in `session/init.lua`). `pane list` / `process-info` are memoized
+---within a single call, so discovery costs O(sources + panes) spawns.
+---Any failed query soft-fails and is counted; a single bounded warning makes
+---discovery failures visible instead of silently returning nothing (D18).
 ---@return sidekick.cli.session.State[]
 function M.sessions()
-  return {}
+  local Session = require("sidekick.cli.session")
+  local Terminal = require("sidekick.cli.terminal")
+  local tools = Config.tools()
+
+  ---Collect the pids of the embedded terminal that owns a discovered pane (D15).
+  ---Matches by `sid` first, then by `terminal_id`, so a tool that changed its
+  ---working directory since launch still merges into the same session.
+  ---@param sid string
+  ---@param terminal_id? string
+  ---@return integer[]
+  local function find_pids(sid, terminal_id)
+    local pids = {} ---@type integer[]
+    for _, t in pairs(Terminal.terminals) do
+      if t.mux_backend == "herdr" then
+        local parent_id = t.parent and t.parent.herdr_terminal_id
+        if t.mux_session == sid or (terminal_id ~= nil and parent_id == terminal_id) then
+          vim.list_extend(pids, t.pids or {})
+        end
+      end
+    end
+    return pids
+  end
+
+  local ret = {} ---@type sidekick.cli.session.State[]
+  local by_id = {} ---@type table<string, sidekick.cli.session.State>
+  -- memoized per call so discovery is O(sources + panes), not O(sources * panes)
+  local pane_cache = {} ---@type table<string, table[]>
+  local proc_cache = {} ---@type table<string, table|false>
+  local failed = 0
+
+  for _, source in ipairs(M.sources()) do
+    local skey = source.name or "\0current"
+    local pane_list = pane_cache[skey]
+    if not pane_list then
+      local list = M.json(M.cmd(source.name, { "pane", "list" }, source.current))
+      if list == nil or list.error then
+        failed = failed + 1
+      end
+      pane_list = panes(list)
+      pane_cache[skey] = pane_list
+    end
+    for _, pane in ipairs(pane_list) do
+      local pane_id = pane.pane_id or pane.id
+      if pane_id then
+        local pkey = skey .. "\0" .. pane_id
+        local info = proc_cache[pkey]
+        if info == nil then
+          local response = M.json(M.cmd(source.name, { "pane", "process-info", "--pane", pane_id }, source.current))
+          if response == nil or response.error then
+            failed = failed + 1
+          end
+          info = (type(response) == "table" and response.process_info) or false
+          proc_cache[pkey] = info
+        end
+        if info then
+          local matched, proc_pid ---@type sidekick.cli.Tool?, integer?
+          for _, entry in ipairs(info.foreground_processes or {}) do
+            local proc = to_proc(info, entry)
+            for _, tool in pairs(tools) do
+              if tool:is_proc(proc) then
+                matched, proc_pid = tool, proc.pid
+                break
+              end
+            end
+            if matched then
+              break
+            end
+          end
+          if matched then
+            local cwd = pane.foreground_cwd or pane.cwd
+            local sid = Session.sid({ tool = matched.name, cwd = cwd })
+            -- include the source in the fallback so ids cannot collide across
+            -- sources when a pane exposes no `terminal_id`
+            local id = ("herdr %s"):format(pane.terminal_id or (skey .. ":" .. pane_id))
+            local state = by_id[id]
+            if not state then
+              state = {
+                id = id,
+                sid = sid,
+                tool = matched.name,
+                cwd = cwd,
+                herdr_pane_id = pane_id,
+                herdr_terminal_id = pane.terminal_id,
+                herdr_workspace_id = pane.workspace_id,
+                herdr_tab_id = pane.tab_id,
+                herdr_session = source.name,
+                herdr_current = source.current,
+                mux_session = source.name,
+                pids = {},
+              }
+              by_id[id] = state
+              ret[#ret + 1] = state
+            end
+            local pids = state.pids ---@type integer[]
+            local function push(pid)
+              if pid ~= nil and not vim.tbl_contains(pids, pid) then
+                pids[#pids + 1] = pid
+              end
+            end
+            push(info.shell_pid)
+            push(proc_pid)
+            for _, pid in ipairs(find_pids(sid, pane.terminal_id)) do
+              push(pid)
+            end
+          end
+        end
+      end
+    end
+  end
+
+  if failed > 0 and warn_once("discovery", "failed") then
+    Util.warn(("herdr: failed to query %d discovery target(s); is the herdr server running?"):format(failed))
+  end
+
+  return ret
 end
 
 ---Start a new session (creation: P2).
 ---@return sidekick.cli.terminal.Cmd?
 function M:start()
   self:nested_warn()
-  local current = self.external == true
+  local current = self.herdr_current == true
   if not self.external then
     if not M.ensure_server(self.herdr_session, current) then
       return nil
@@ -491,7 +719,7 @@ function M:send(text)
   if not pane_id then
     return
   end
-  local session, current = self.herdr_session, self.external == true
+  local session, current = self.herdr_session, self.herdr_current == true
   local function send()
     Util.exec(M.cmd(session, { "pane", "send-text", pane_id, text }, current), { notify = true })
   end
@@ -509,7 +737,7 @@ function M:submit()
   if not pane_id then
     return
   end
-  local session, current = self.herdr_session, self.external == true
+  local session, current = self.herdr_session, self.herdr_current == true
   Util.exec(M.cmd(session, { "pane", "send-keys", pane_id, "Enter" }, current), { notify = true })
 end
 
@@ -521,7 +749,7 @@ function M:dump()
   if not pane_id then
     return
   end
-  local session, current = self.herdr_session, self.external == true
+  local session, current = self.herdr_session, self.herdr_current == true
   local args = {
     "pane",
     "read",

@@ -197,6 +197,11 @@ function M.attach(state, opts)
   elseif attached then
     Util.info("Attached to `" .. state.tool.name .. "`")
   end
+  -- external sessions have no terminal to focus, so give the backend a chance
+  -- to focus its own surface (e.g. a mux pane)
+  if opts.focus and state.external and session.focus then
+    session:focus()
+  end
   return state, attached
 end
 

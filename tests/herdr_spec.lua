@@ -52,8 +52,30 @@ local function tool_session(overrides)
       end,
     },
   }
-  return setmetatable(vim.tbl_deep_extend("force", state, overrides or {}), Herdr) --[[@as sidekick.cli.Session]]
+  local s = vim.tbl_deep_extend("force", state, overrides or {})
+  -- mirror `init()`: created external sessions target the current server
+  if s.herdr_current == nil then
+    s.herdr_current = s.external == true
+  end
+  return setmetatable(s, Herdr) --[[@as sidekick.cli.Session]]
 end
+
+---Build a minimal fake tool that matches any process whose command contains `name`.
+---@param name string
+---@return sidekick.cli.Tool
+local function fake_tool(name)
+  return {
+    name = name,
+    cmd = { name },
+    is_proc = function(_, proc)
+      return (proc.cmd or ""):find(name, 1, true) ~= nil
+    end,
+  }
+end
+
+---`pane list` payload with a single pane running the fake tool.
+local TOOL_PANE = '{"id":"1","result":{"panes":[{"pane_id":"w1:p1","terminal_id":"t1",'
+  .. '"workspace_id":"w1","tab_id":"w1:t1","cwd":"/tmp/cwd","foreground_cwd":"/tmp/cwd"}]}}'
 
 ---Stub `Util.exec` with a per-command handler, recording every argv.
 ---The handler returns stdout (success) or `nil` (failure).
@@ -70,6 +92,53 @@ local function stub_herdr(handler)
     return { out }, out
   end
   return calls
+end
+
+---Stub a running named session `work` whose single pane runs the fake tool.
+---@return string[][]
+local function stub_named_discovery()
+  Config.tools = function()
+    return { tool = fake_tool("tool") }
+  end
+  return stub_herdr(function(cmd)
+    if vim.tbl_contains(cmd, "session") then
+      return '{"sessions":[{"name":"work","running":true,"default":true}]}'
+    elseif vim.tbl_contains(cmd, "process-info") then
+      return TOOL_PROC
+    end
+    return TOOL_PANE
+  end)
+end
+
+---Stub discovery for the current (session-less) source.
+---@param sessions? string raw `session list` payload
+---@return string[][]
+local function stub_current_discovery(sessions)
+  Config.tools = function()
+    return { tool = fake_tool("tool") }
+  end
+  return stub_herdr(function(cmd)
+    if vim.tbl_contains(cmd, "session") then
+      return sessions or '{"sessions":[{"name":"work","running":true,"default":true}]}'
+    elseif vim.tbl_contains(cmd, "process-info") then
+      return TOOL_PROC
+    end
+    return TOOL_PANE
+  end)
+end
+
+---Drive a discovered state through the production path (`Session.new`).
+---@param state table
+---@return sidekick.cli.Session
+local function discover_new(state)
+  local Session = require("sidekick.cli.session")
+  Config.get_tool = function(name)
+    return fake_tool(name)
+  end
+  Session.setup()
+  state.backend = "herdr"
+  state.started = true
+  return Session.new(state)
 end
 
 ---Find the first recorded command whose argv contains all of `parts`.
@@ -107,11 +176,17 @@ describe("herdr backend", function()
   local orig_workspace_id
   local orig_vertical
   local orig_size
+  local orig_socket_path
+  local orig_tools
+  local orig_get_tool
 
   before_each(function()
     orig_exec = Util.exec
     orig_bin_path = vim.env.HERDR_BIN_PATH
     orig_herdr_env = vim.env.HERDR_ENV
+    orig_socket_path = vim.env.HERDR_SOCKET_PATH
+    orig_tools = Config.tools
+    orig_get_tool = Config.get_tool
     orig_create = Config.cli.mux.create
     orig_jobstart = vim.fn.jobstart
     orig_error = Util.error
@@ -126,6 +201,7 @@ describe("herdr backend", function()
     -- avoid inheriting a real herdr environment from the parent shell
     vim.env.HERDR_BIN_PATH = "herdr"
     vim.env.HERDR_ENV = nil
+    vim.env.HERDR_SOCKET_PATH = nil
     vim.env.HERDR_WORKSPACE_ID = nil
     -- reset module-level warn-once bookkeeping (F4) for test isolation
     Herdr._warned = {}
@@ -141,6 +217,9 @@ describe("herdr backend", function()
     Util.exec = orig_exec
     vim.env.HERDR_BIN_PATH = orig_bin_path
     vim.env.HERDR_ENV = orig_herdr_env
+    vim.env.HERDR_SOCKET_PATH = orig_socket_path
+    Config.tools = orig_tools
+    Config.get_tool = orig_get_tool
     Config.cli.mux.create = orig_create
     vim.fn.jobstart = orig_jobstart
     Util.error = orig_error
@@ -396,9 +475,313 @@ describe("herdr backend", function()
     end)
   end)
 
-  describe("sessions() (P3 boundary)", function()
-    it("returns an empty list", function()
+  describe("sources() (P3/D8/D16)", function()
+    it("includes the current session and drops non-running named sessions", function()
+      vim.env.HERDR_ENV = "1"
+      stub_herdr(function()
+        return '{"sessions":[{"name":"work","running":true,"default":true},{"name":"down","running":false}]}'
+      end)
+      assert.are.same({ { name = "work", current = true } }, Herdr.sources())
+    end)
+
+    it("deduplicates the current session against the matching socket entry (D16)", function()
+      vim.env.HERDR_ENV = "1"
+      vim.env.HERDR_SOCKET_PATH = "/tmp/sock"
+      stub_herdr(function()
+        return '{"sessions":[{"name":"a","running":true,"socket_path":"/tmp/sock"},{"name":"b","running":true}]}'
+      end)
+      assert.are.same({ { name = "a", current = true }, { name = "b", current = false } }, Herdr.sources())
+    end)
+
+    it("lists only running named sessions when outside herdr", function()
+      vim.env.HERDR_ENV = nil
+      stub_herdr(function()
+        return '{"sessions":[{"name":"a","running":true},{"name":"b","running":false}]}'
+      end)
+      assert.are.same({ { name = "a", current = false } }, Herdr.sources())
+    end)
+
+    it("returns no sources when the server is down", function()
+      vim.env.HERDR_ENV = nil
+      Util.exec = function()
+        return nil
+      end
+      assert.are.same({}, Herdr.sources())
+    end)
+  end)
+
+  describe("sessions() (P3/D8/D15/D16/D18)", function()
+    local Session = require("sidekick.cli.session")
+
+    it("maps a pane + process-info to a state with the right sid/mux_session/id", function()
+      vim.env.HERDR_ENV = nil
+      local calls = stub_named_discovery()
+      local ret = Herdr.sessions()
+      assert.are.equal(1, #ret)
+      local sid = Session.sid({ tool = "tool", cwd = "/tmp/cwd" })
+      assert.are.equal("herdr t1", ret[1].id)
+      assert.are.equal(sid, ret[1].sid)
+      -- F1/F2: the source identity is carried, not the sid
+      assert.are.equal("work", ret[1].mux_session)
+      assert.are.equal("work", ret[1].herdr_session)
+      assert.is_false(ret[1].herdr_current)
+      assert.are.equal("tool", ret[1].tool)
+      assert.are.equal("/tmp/cwd", ret[1].cwd)
+      assert.are.equal("w1:p1", ret[1].herdr_pane_id)
+      assert.are.equal("t1", ret[1].herdr_terminal_id)
+      assert.are.equal("w1", ret[1].herdr_workspace_id)
+      assert.are.equal("w1:t1", ret[1].herdr_tab_id)
+      assert.is_true(vim.tbl_contains(ret[1].pids, 100))
+      assert.is_true(vim.tbl_contains(ret[1].pids, 101))
+      -- named source is targeted via the global --session
+      assert.are.same({ "herdr", "--session", "work", "pane", "list" }, find_call(calls, { "pane", "list" }))
+    end)
+
+    it("queries the current source without --session", function()
+      vim.env.HERDR_ENV = "1"
+      local calls = stub_current_discovery()
+      Herdr.sessions()
+      assert.are.same({ "herdr", "pane", "list" }, find_call(calls, { "pane", "list" }))
+    end)
+
+    it("merges pids from the embedded Terminal registry (D15)", function()
+      vim.env.HERDR_ENV = nil
+      stub_named_discovery()
+      local Terminal = require("sidekick.cli.terminal")
+      local sid = Session.sid({ tool = "tool", cwd = "/tmp/cwd" })
+      local orig = Terminal.terminals
+      Terminal.terminals = { { mux_backend = "herdr", mux_session = sid, pids = { 55 } } }
+      local ret = Herdr.sessions()
+      Terminal.terminals = orig
+      assert.is_true(vim.tbl_contains(ret[1].pids, 55))
+    end)
+
+    it("merges pids by terminal_id when the sid drifted (D15)", function()
+      vim.env.HERDR_ENV = nil
+      stub_named_discovery()
+      local Terminal = require("sidekick.cli.terminal")
+      local orig = Terminal.terminals
+      Terminal.terminals = {
+        { mux_backend = "herdr", mux_session = "drifted sid", parent = { herdr_terminal_id = "t1" }, pids = { 77 } },
+      }
+      local ret = Herdr.sessions()
+      Terminal.terminals = orig
+      assert.is_true(vim.tbl_contains(ret[1].pids, 77))
+    end)
+
+    it("collapses a duplicate terminal_id across sources to a single id (D16)", function()
+      vim.env.HERDR_ENV = "1"
+      vim.env.HERDR_SOCKET_PATH = "/tmp/sock"
+      Config.tools = function()
+        return { tool = fake_tool("tool") }
+      end
+      local calls = stub_herdr(function(cmd)
+        if vim.tbl_contains(cmd, "session") then
+          -- the current session is not named here, so it cannot be deduplicated
+          return '{"sessions":[{"name":"b","running":true}]}'
+        elseif vim.tbl_contains(cmd, "process-info") then
+          return TOOL_PROC
+        end
+        return TOOL_PANE
+      end)
+      local ret = Herdr.sessions()
+      assert.are.equal(1, #ret)
+      assert.are.equal("herdr t1", ret[1].id)
+      -- two sources scanned the same pane, but only one process-info per source
+      assert.are.equal(2, #vim.tbl_filter(function(cmd)
+        return vim.tbl_contains(cmd, "process-info")
+      end, calls))
+    end)
+
+    it("memoizes pane list / process-info within a single call (D8)", function()
+      vim.env.HERDR_ENV = nil
+      Config.tools = function()
+        return { tool = fake_tool("tool") }
+      end
+      local counts = { session = 0, pane_list = 0, process = 0 }
+      stub_herdr(function(cmd)
+        if vim.tbl_contains(cmd, "session") then
+          counts.session = counts.session + 1
+          return '{"sessions":[{"name":"work","running":true,"default":true}]}'
+        elseif vim.tbl_contains(cmd, "process-info") then
+          counts.process = counts.process + 1
+          return TOOL_PROC
+        end
+        counts.pane_list = counts.pane_list + 1
+        return '{"id":"1","result":{"panes":['
+          .. '{"pane_id":"w1:p1","terminal_id":"t1","cwd":"/tmp/cwd"},'
+          .. '{"pane_id":"w1:p2","terminal_id":"t2","cwd":"/tmp/cwd"}]}}'
+      end)
+      local ret = Herdr.sessions()
+      assert.are.equal(2, #ret)
+      assert.are.equal(1, counts.session)
+      assert.are.equal(1, counts.pane_list)
+      assert.are.equal(2, counts.process)
+    end)
+
+    it("soft-fails and warns once when the server is down (D18)", function()
+      vim.env.HERDR_ENV = nil
+      Config.tools = function()
+        return { tool = fake_tool("tool") }
+      end
+      local warns = {}
+      Util.warn = function(msg)
+        warns[#warns + 1] = msg
+      end
+      stub_herdr(function(cmd)
+        if vim.tbl_contains(cmd, "session") then
+          return '{"sessions":[{"name":"work","running":true,"default":true}]}'
+        end
+        return nil -- pane list fails: the server is down
+      end)
       assert.are.same({}, Herdr.sessions())
+      assert.are.equal(1, #warns)
+      Herdr.sessions() -- a second failure must not warn again (bounded)
+      assert.are.equal(1, #warns)
+    end)
+  end)
+
+  describe("focus() (D9)", function()
+    it("reveals the workspace and tab derived from the pane id", function()
+      vim.env.HERDR_BIN_PATH = "herdr"
+      -- no workspace_id/tab_id: the workspace is derived from the `w1:p19` prefix
+      local s = tool_session({ herdr_pane_id = "w1:p19", herdr_terminal_id = "t1" })
+      local calls = stub_herdr(function()
+        return ""
+      end)
+      assert.are.equal(s, s:focus())
+      assert.are.same({ "herdr", "--session", "sess", "workspace", "focus", "w1" }, calls[1])
+      assert.are.equal(1, #calls) -- no tab id resolvable → only the workspace
+    end)
+
+    it("uses a known tab id", function()
+      vim.env.HERDR_BIN_PATH = "herdr"
+      local s = tool_session({
+        herdr_pane_id = "w1:p1",
+        herdr_terminal_id = "t1",
+        herdr_workspace_id = "w1",
+        herdr_tab_id = "w1:t1",
+      })
+      local calls = stub_herdr(function()
+        return ""
+      end)
+      s:focus()
+      assert.are.same({ "herdr", "--session", "sess", "workspace", "focus", "w1" }, calls[1])
+      assert.are.same({ "herdr", "--session", "sess", "tab", "focus", "w1:t1" }, calls[2])
+    end)
+
+    it("omits --session for external sessions", function()
+      vim.env.HERDR_BIN_PATH = "herdr"
+      local s = tool_session({ external = true, herdr_pane_id = "w7:p1", herdr_terminal_id = "t7" })
+      local calls = stub_herdr(function()
+        return ""
+      end)
+      s:focus()
+      assert.are.same({ "herdr", "workspace", "focus", "w7" }, calls[1])
+    end)
+
+    it("does nothing when no pane resolves", function()
+      local s = tool_session({ herdr_terminal_id = "nope" })
+      local calls = stub_herdr(function()
+        return '{"result":{"panes":[]}}'
+      end)
+      assert.are.equal(s, s:focus())
+      -- only the pane lookup ran; no workspace/tab focus was spawned
+      assert.are.equal(1, #calls)
+      assert.are.same({ "herdr", "--session", "sess", "pane", "list" }, calls[1])
+    end)
+
+    it("spawns nothing when no location can be resolved", function()
+      -- not external and no herdr session: `pane()` cannot even list panes, so
+      -- the best-effort reveal returns without spawning any herdr command
+      local s = new_session({ sid = "sid", cwd = "/tmp/cwd" })
+      Util.exec = function()
+        error("focus must not spawn when no location can be resolved")
+      end
+      assert.are.equal(s, s:focus())
+    end)
+
+    it("skips the workspace but still reveals a known tab", function()
+      vim.env.HERDR_BIN_PATH = "herdr"
+      -- opaque pane id (no `w1:` prefix) and no workspace_id → only the tab resolves
+      local s = tool_session({ herdr_pane_id = "opaque", herdr_terminal_id = "t1", herdr_tab_id = "w1:t1" })
+      local calls = stub_herdr(function()
+        return ""
+      end)
+      assert.are.equal(s, s:focus())
+      assert.are.equal(1, #calls)
+      assert.are.same({ "herdr", "--session", "sess", "tab", "focus", "w1:t1" }, calls[1])
+    end)
+  end)
+
+  describe("discovered session identity (F1/F2)", function()
+    it("classifies a named-source pane as external, priority 10, and targets --session", function()
+      vim.env.HERDR_ENV = nil
+      local calls = stub_named_discovery()
+      local s = discover_new(Herdr.sessions()[1])
+      assert.is_true(s.external)
+      assert.are.equal(10, s.priority)
+      assert.are.equal("work", s.mux_session)
+      assert.are.equal("work", s.herdr_session)
+      assert.is_false(s.herdr_current)
+      -- external sessions are not attached from Neovim (tmux parity)
+      assert.is_nil(s:attach())
+      -- a discovered pane whose session exists reports running, and commands
+      -- are scoped to the real source name
+      assert.is_true(s:is_running())
+      assert.are.equal("w1", s.herdr_workspace_id)
+      assert.are.equal("w1:t1", s.herdr_tab_id)
+      s:focus()
+      assert.are.same(
+        { "herdr", "--session", "work", "workspace", "focus", "w1" },
+        find_call(calls, { "workspace", "focus" })
+      )
+      assert.are.same({ "herdr", "--session", "work", "tab", "focus", "w1:t1" }, find_call(calls, { "tab", "focus" }))
+    end)
+
+    it("classifies a current-source pane as external and omits --session", function()
+      vim.env.HERDR_ENV = "1"
+      local calls = stub_current_discovery('{"sessions":[]}')
+      local states = Herdr.sessions()
+      assert.are.equal(1, #states)
+      -- the session-less source carries no name
+      assert.is_nil(states[1].mux_session)
+      assert.is_nil(states[1].herdr_session)
+      assert.is_true(states[1].herdr_current)
+      local s = discover_new(states[1])
+      assert.is_true(s.external)
+      assert.are.equal(10, s.priority)
+      assert.is_nil(s.mux_session)
+      assert.is_true(s.herdr_current)
+      assert.is_true(s:is_running())
+      assert.are.same({ "herdr", "pane", "list" }, find_call(calls, { "pane", "list" }))
+      s:focus()
+      -- D9 revised: no absolute pane focus; reveal workspace then tab, without --session
+      assert.are.same({ "herdr", "workspace", "focus", "w1" }, find_call(calls, { "workspace", "focus" }))
+      assert.are.same({ "herdr", "tab", "focus", "w1:t1" }, find_call(calls, { "tab", "focus" }))
+    end)
+  end)
+
+  describe("focus wiring through cli.state (D9 / PR #198)", function()
+    local Session = require("sidekick.cli.session")
+
+    it("focuses a discovered external session", function()
+      vim.env.HERDR_ENV = nil
+      local State = require("sidekick.cli.state")
+      local calls = stub_named_discovery()
+      local s = discover_new(Herdr.sessions()[1])
+      assert.is_true(s.external)
+      -- mark it attached so `Session.attach` is a no-op and does not emit
+      Session._attached[s.id] = s
+      local ok = pcall(State.attach, { session = s, tool = s.tool }, { focus = true })
+      Session._attached[s.id] = nil
+      assert.is_true(ok)
+      -- D9 revised: the workspace/tab are revealed, scoped to the source session
+      assert.are.same(
+        { "herdr", "--session", "work", "workspace", "focus", "w1" },
+        find_call(calls, { "workspace", "focus" })
+      )
+      assert.are.same({ "herdr", "--session", "work", "tab", "focus", "w1:t1" }, find_call(calls, { "tab", "focus" }))
     end)
   end)
 
@@ -701,6 +1084,41 @@ describe("herdr backend", function()
       assert.are.equal("t1", s.herdr_terminal_id)
       assert.are.same({ "herdr", "--session", "sess", "pane", "run", "w1:p1", "exec 'tool' 'arg'" }, calls[1])
       assert.are.same({ "herdr", "--session", "sess", "pane", "process-info", "--pane", "w1:p1" }, calls[2])
+    end)
+
+    it("records the location carried by the create/split payload (D9 reveal)", function()
+      vim.env.HERDR_BIN_PATH = "herdr"
+      local s = tool_session()
+      vim.wait = function() end
+      stub_herdr(function(cmd)
+        if vim.tbl_contains(cmd, "process-info") then
+          return TOOL_PROC
+        end
+        return ""
+      end)
+      assert.is_true(s:launch_pane({
+        pane_id = "w1:p1",
+        terminal_id = "t1",
+        workspace_id = "w1",
+        tab_id = "w1:t1",
+      }))
+      assert.are.equal("w1", s.herdr_workspace_id)
+      assert.are.equal("w1:t1", s.herdr_tab_id)
+    end)
+
+    it("leaves the location untouched when the payload omits it", function()
+      vim.env.HERDR_BIN_PATH = "herdr"
+      local s = tool_session({ herdr_workspace_id = "w1", herdr_tab_id = "w1:t1" })
+      vim.wait = function() end
+      stub_herdr(function(cmd)
+        if vim.tbl_contains(cmd, "process-info") then
+          return TOOL_PROC
+        end
+        return ""
+      end)
+      assert.is_true(s:launch_pane({ pane_id = "w1:p1", terminal_id = "t1" }))
+      assert.are.equal("w1", s.herdr_workspace_id)
+      assert.are.equal("w1:t1", s.herdr_tab_id)
     end)
 
     it("retries `pane run` until process-info shows the tool (F2)", function()
