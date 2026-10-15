@@ -34,6 +34,26 @@ local TOOL_PROC = '{"id":"1","result":{"process_info":{"shell_pid":100,'
   .. '"foreground_processes":[{"pid":101,"cmdline":"tool arg","cwd":"/tmp/cwd"}]}}}'
 ---`pane process-info` payload with no foreground process yet (F2).
 local NO_PROC = '{"id":"1","result":{"process_info":{"shell_pid":100,"foreground_processes":[]}}}'
+---`pane process-info` payload whose foreground no longer matches the idle shell
+---but does not match the fake tool either: a `proc_running` false negative after
+---the tool already started (R14).
+local OTHER_PROC = '{"id":"1","result":{"process_info":{"shell_pid":100,'
+  .. '"foreground_processes":[{"pid":101,"cmdline":"zsh -l","cwd":"/tmp/cwd"}]}}}'
+---`pane process-info` payload for a fresh pane idling at its shell: a concrete
+---foreground identity (shell `name`/`argv0`) forming the R14 pre-injection
+---baseline. Its identity differs from `OTHER_PROC`, which stands in for a
+---*changed* foreground that `is_proc` fails to match.
+local SHELL_PROC = '{"id":"1","result":{"process_info":{"shell_pid":100,'
+  .. '"foreground_processes":[{"pid":100,"name":"zsh","argv0":"zsh","cmdline":"zsh -l","cwd":"/tmp/cwd"}]}}}'
+---`pane process-info` payload for the R15 false negative: the injected binary `q`
+---is a foreground token, but the discovery token `qchat` (mirroring `amazon_q`) is
+---absent, so `is_proc` alone would miss the running tool.
+local Q_PROC = '{"id":"1","result":{"process_info":{"shell_pid":100,'
+  .. '"foreground_processes":[{"pid":101,"cmdline":"q --version","cwd":"/tmp/cwd"}]}}}'
+---`pane process-info` payload that merely contains the short injected token `q`
+---inside a flag: it must not be mistaken for a started tool (R15 false positive).
+local FLAG_PROC = '{"id":"1","result":{"process_info":{"shell_pid":100,'
+  .. '"foreground_processes":[{"pid":101,"cmdline":"zsh -q","cwd":"/tmp/cwd"}]}}}'
 
 ---Build a herdr session instance with a fake tool.
 ---@param overrides? table
@@ -58,6 +78,27 @@ local function tool_session(overrides)
     s.herdr_current = s.external == true
   end
   return setmetatable(s, Herdr) --[[@as sidekick.cli.Session]]
+end
+
+---Build a herdr session whose injected binary and `is_proc` token differ,
+---mirroring `amazon_q` (`cmd = { "q" }`, `is_proc` matching `qchat`) (R15).
+---Built directly (not via `tool_session`) so `cmd` is exactly `{ "q" }`.
+---@return sidekick.cli.Session
+local function q_session()
+  return new_session({
+    sid = "sid",
+    cwd = "/tmp/cwd",
+    herdr_session = "sess",
+    external = false,
+    herdr_current = false,
+    tool = {
+      name = "amazon_q",
+      cmd = { "q" },
+      is_proc = function(_, proc)
+        return (proc.cmd or ""):find("qchat", 1, true) ~= nil
+      end,
+    },
+  })
 end
 
 ---Build a minimal fake tool that matches any process whose command contains `name`.
@@ -639,6 +680,25 @@ describe("herdr backend", function()
       Herdr.sessions() -- a second failure must not warn again (bounded)
       assert.are.equal(1, #warns)
     end)
+
+    it("does not apply the launch-only injected-binary rule during discovery (R15)", function()
+      vim.env.HERDR_ENV = nil
+      -- amazon_q-style tool: `is_proc` matches `qchat`, but the foreground only
+      -- shows the injected `q`. Discovery must keep matching via `is_proc` alone
+      -- (the `matches_injected` OR is launch-only), so no session is emitted.
+      Config.tools = function()
+        return { amazon_q = q_session().tool }
+      end
+      stub_herdr(function(cmd)
+        if vim.tbl_contains(cmd, "session") then
+          return '{"sessions":[{"name":"work","running":true,"default":true}]}'
+        elseif vim.tbl_contains(cmd, "process-info") then
+          return Q_PROC
+        end
+        return TOOL_PANE
+      end)
+      assert.are.same({}, Herdr.sessions())
+    end)
   end)
 
   describe("focus() (D9)", function()
@@ -1143,6 +1203,39 @@ describe("herdr backend", function()
     end)
   end)
 
+  describe("proc_running() launch confirmation (R15)", function()
+    local function info_cmd(cmd)
+      return vim.tbl_contains(cmd, "process-info")
+    end
+
+    it("matches the injected binary when is_proc does not (false negative fixed)", function()
+      vim.env.HERDR_BIN_PATH = "herdr"
+      local s = q_session()
+      stub_herdr(function(cmd)
+        return info_cmd(cmd) and Q_PROC or ""
+      end)
+      assert.is_true(s:proc_running("w1:p1"))
+    end)
+
+    it("ignores the short injected token inside a flag (no false positive)", function()
+      vim.env.HERDR_BIN_PATH = "herdr"
+      local s = q_session()
+      stub_herdr(function(cmd)
+        return info_cmd(cmd) and FLAG_PROC or ""
+      end)
+      assert.is_false(s:proc_running("w1:p1"))
+    end)
+
+    it("ignores a plainly unrelated foreground process (no false positive)", function()
+      vim.env.HERDR_BIN_PATH = "herdr"
+      local s = q_session()
+      stub_herdr(function(cmd)
+        return info_cmd(cmd) and OTHER_PROC or ""
+      end)
+      assert.is_false(s:proc_running("w1:p1"))
+    end)
+  end)
+
   describe("launch_pane()", function()
     it("runs `pane run exec` and records the pane once the process is up (F2)", function()
       vim.env.HERDR_BIN_PATH = "herdr"
@@ -1158,8 +1251,12 @@ describe("herdr backend", function()
       assert.is_true(s.started)
       assert.are.equal("w1:p1", s.herdr_pane_id)
       assert.are.equal("t1", s.herdr_terminal_id)
-      assert.are.same({ "herdr", "--session", "sess", "pane", "run", "w1:p1", "exec 'tool' 'arg'" }, calls[1])
+      -- R14: the first call captures the pre-injection foreground baseline and
+      -- the second is attempt 1's own guard probe (taken unconditionally)
+      assert.are.same({ "herdr", "--session", "sess", "pane", "process-info", "--pane", "w1:p1" }, calls[1])
       assert.are.same({ "herdr", "--session", "sess", "pane", "process-info", "--pane", "w1:p1" }, calls[2])
+      assert.are.same({ "herdr", "--session", "sess", "pane", "run", "w1:p1", "exec 'tool' 'arg'" }, calls[3])
+      assert.are.same({ "herdr", "--session", "sess", "pane", "process-info", "--pane", "w1:p1" }, calls[4])
     end)
 
     it("records the location carried by the create/split payload (D9 reveal)", function()
@@ -1205,8 +1302,10 @@ describe("herdr backend", function()
       stub_herdr(function(cmd)
         if vim.tbl_contains(cmd, "process-info") then
           polls = polls + 1
-          -- the tool only shows up on the second attempt (after PROC_POLLS polls)
-          return polls > 5 and TOOL_PROC or NO_PROC
+          -- the pane stays idle at its shell until a second injection happens;
+          -- the tool only shows up once that attempt has run (R14: still idle,
+          -- so re-injecting is safe)
+          return runs > 1 and TOOL_PROC or NO_PROC
         end
         if vim.tbl_contains(cmd, "run") then
           runs = runs + 1
@@ -1216,6 +1315,121 @@ describe("herdr backend", function()
       assert.is_true(s:launch_pane({ pane_id = "w1:p1", terminal_id = "t1" }))
       assert.are.equal(2, runs)
       assert.is_true(polls > 5)
+    end)
+
+    it("still re-injects while the pane stays idle at its baseline shell (F2/R14)", function()
+      vim.env.HERDR_BIN_PATH = "herdr"
+      local s = tool_session()
+      vim.wait = function() end
+      local runs = 0
+      stub_herdr(function(cmd)
+        if vim.tbl_contains(cmd, "process-info") then
+          -- foreground never leaves the idle baseline until the tool is up
+          return runs >= 2 and TOOL_PROC or NO_PROC
+        end
+        if vim.tbl_contains(cmd, "run") then
+          runs = runs + 1
+        end
+        return ""
+      end)
+      assert.is_true(s:launch_pane({ pane_id = "w1:p1", terminal_id = "t1" }))
+      assert.are.equal(2, runs)
+    end)
+
+    it("re-injects when a nil baseline later shows an idle shell (R14/F1)", function()
+      vim.env.HERDR_BIN_PATH = "herdr"
+      local s = tool_session()
+      vim.wait = function() end
+      local errors = {}
+      Util.error = function(msg)
+        errors[#errors + 1] = msg
+      end
+      local polls = 0
+      local calls = stub_herdr(function(cmd)
+        if vim.tbl_contains(cmd, "process-info") then
+          polls = polls + 1
+          -- fresh pane: no foreground process at all through attempt 1, so the
+          -- baseline is `nil` and nothing proves the tool started...
+          if polls <= 7 then
+            return NO_PROC
+          end
+          -- ...the shell only appears by attempt 2's guard probe. A `nil`
+          -- baseline must not be read as "the tool started", so the guard has
+          -- to allow a second injection (F1).
+          if polls == 8 then
+            return SHELL_PROC
+          end
+          return TOOL_PROC
+        end
+        return ""
+      end)
+      assert.is_true(s:launch_pane({ pane_id = "w1:p1", terminal_id = "t1" }))
+      assert.is_true(s.started)
+      -- the second injection is what finally started the tool
+      assert.are.equal(2, #vim.tbl_filter(function(c)
+        return vim.tbl_contains(c, "run")
+      end, calls))
+      assert.is_nil(find_call(calls, { "pane", "close" }))
+      assert.are.equal(0, #errors)
+    end)
+
+    it("does not re-inject once the foreground changed, but keeps polling to success (R14)", function()
+      vim.env.HERDR_BIN_PATH = "herdr"
+      local s = tool_session()
+      vim.wait = function() end
+      local runs, polls = 0, 0
+      stub_herdr(function(cmd)
+        if vim.tbl_contains(cmd, "process-info") then
+          polls = polls + 1
+          -- concrete idle-shell baseline (baseline probe + attempt 1's guard)
+          if polls <= 2 then
+            return SHELL_PROC
+          end
+          -- attempt 1's injection did start something (foreground changed away
+          -- from the baseline) but `proc_running` misses it until later
+          return polls >= 9 and TOOL_PROC or OTHER_PROC
+        end
+        if vim.tbl_contains(cmd, "run") then
+          runs = runs + 1
+        end
+        return ""
+      end)
+      assert.is_true(s:launch_pane({ pane_id = "w1:p1", terminal_id = "t1" }))
+      -- the tool is only observed after the first attempt gave up polling
+      assert.is_true(polls >= 9)
+      -- ...and crucially the pane was never injected a second time
+      assert.are.equal(1, runs)
+    end)
+
+    it("does not re-inject when the foreground changed and the tool never appears (R14)", function()
+      vim.env.HERDR_BIN_PATH = "herdr"
+      local s = tool_session()
+      local errors = {}
+      Util.error = function(msg)
+        errors[#errors + 1] = msg
+      end
+      vim.wait = function() end
+      local runs, polls = 0, 0
+      local calls = stub_herdr(function(cmd)
+        if vim.tbl_contains(cmd, "process-info") then
+          polls = polls + 1
+          -- concrete idle-shell baseline, then a changed foreground that never
+          -- matches the tool: the outcome follows `wait_proc`, not a re-injection
+          return polls <= 2 and SHELL_PROC or OTHER_PROC
+        end
+        if vim.tbl_contains(cmd, "run") then
+          runs = runs + 1
+        end
+        return ""
+      end)
+      assert.is_false(s:launch_pane({ pane_id = "w1:p1", terminal_id = "t1" }))
+      assert.are.equal(1, runs)
+      -- exhaustion still clears the cached identity, closes the pane and errors
+      assert.is_nil(s.started)
+      assert.is_nil(s.herdr_pane_id)
+      assert.is_nil(s.herdr_terminal_id)
+      assert.are.equal(1, #errors)
+      assert.are.same({ "herdr", "--session", "sess", "pane", "close", "w1:p1" }, calls[#calls])
     end)
 
     it("closes the pane and errors when the process never appears (F2)", function()
@@ -1262,6 +1476,28 @@ describe("herdr backend", function()
       assert.is_nil(s.started)
       assert.are.equal(1, #errors)
       assert.are.same({ "herdr", "--session", "sess", "pane", "close", "w1:p1" }, calls[#calls])
+    end)
+
+    it("confirms a launch via the injected binary without exhausting or closing (R15)", function()
+      vim.env.HERDR_BIN_PATH = "herdr"
+      local s = q_session()
+      vim.wait = function() end
+      local errors = {}
+      Util.error = function(msg)
+        errors[#errors + 1] = msg
+      end
+      local calls = stub_herdr(function(cmd)
+        return vim.tbl_contains(cmd, "process-info") and Q_PROC or ""
+      end)
+      assert.is_true(s:launch_pane({ pane_id = "w1:p1", terminal_id = "t1" }))
+      assert.is_true(s.started)
+      -- one injection only: the tool was confirmed, so the pane is neither
+      -- re-injected nor closed and no failure is reported
+      assert.are.equal(1, #vim.tbl_filter(function(c)
+        return vim.tbl_contains(c, "run")
+      end, calls))
+      assert.is_nil(find_call(calls, { "pane", "close" }))
+      assert.are.equal(0, #errors)
     end)
   end)
 

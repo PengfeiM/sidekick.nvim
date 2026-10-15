@@ -172,6 +172,9 @@ local LAUNCH_RETRY_DELAY = 100
 local PROC_POLLS = 5
 ---Delay between `pane process-info` polls, in milliseconds.
 ---Worst case per launch: 3 x (5 polls x 100ms) + 2 x 100ms retry ≈ 1.4s (≲3s).
+---The R14 foreground-idle probes (one before the loop, one per attempt —
+---including the first, since the guard snapshot is taken unconditionally) add
+---spawns but no extra waits, so the poll budget above is unchanged.
 local PROC_POLL_INTERVAL = 100
 
 ---Build a `Proc`-shaped table from a `process-info` foreground entry (D19).
@@ -193,6 +196,68 @@ local function to_proc(info, entry)
     cmd = cmd,
     cwd = entry.cwd,
   }
+end
+
+---Capture a pane's foreground identity for the R14 re-injection guard.
+---`pane run` only injects input; `exec` replaces the shell image so the pid is
+---unchanged and cannot tell the tool apart from the shell. The first foreground
+---entry's `name`/`argv0`/`cmdline` does change once something starts, so it
+---answers "is this pane still idle at its shell?". Returns `nil` both while the
+---pane has no foreground process yet (a fresh pane's shell is not up) and on any
+---soft-failed probe; `launch_pane` reads `nil` either way as "no evidence the
+---tool started", so it never suppresses a re-injection on a `nil` snapshot
+---(R14/F1).
+---@param session string
+---@param pane_id string
+---@param current boolean
+---@return string?
+local function foreground_id(session, pane_id, current)
+  local ret = M.json(M.cmd(session, { "pane", "process-info", "--pane", pane_id }, current))
+  local info = type(ret) == "table" and ret.process_info or nil
+  local entry = type(info) == "table" and (info.foreground_processes or {})[1] or nil
+  if type(entry) ~= "table" then
+    return nil
+  end
+  return table.concat({ entry.name or "", entry.argv0 or entry.cmdline or "" }, "\0")
+end
+
+---Match a foreground entry against the binary we injected (`tool.cmd[1]`).
+---Launch-only evidence (R15): `tool:is_proc` is tuned for *discovery* — claiming a
+---tool found among arbitrary processes — and is not guaranteed to match the
+---command line **we ourselves injected** (`exec <tool.cmd>`). Two gaps:
+---  * token mismatch, e.g. `amazon_q` has `cmd = { "q" }` but `is_proc` matches
+---    `\<qchat\>`; and
+---  * wrapper-launched tools (`sh -c …`, `npx …`, `node …`) whose `is_proc` token
+---    never appears in the immediate `foreground_processes` entry.
+---The injected binary is compared as a whole token against `name`/`argv0` (by
+---basename) and each whitespace-delimited `cmdline` token, so a short binary such
+---as `q` cannot false-positive on a flag (`-q`, `--quiet`). This is deliberately
+---stricter than a word-boundary regex, which matches the `q` inside `-q`.
+---@param entry table foreground process entry
+---@param bin? string `tool.cmd[1]`, the binary we injected
+---@return boolean
+local function matches_injected(entry, bin)
+  if type(bin) ~= "string" or bin == "" then
+    return false
+  end
+  ---@param v any
+  ---@return string?
+  local function base(v)
+    return type(v) == "string" and (v:match("[^/\\]+$") or v) or nil
+  end
+  if base(entry.name) == bin or base(entry.argv0) == bin then
+    return true
+  end
+  if type(entry.cmdline) == "string" then
+    for token in entry.cmdline:gmatch("%S+") do
+      -- strip shell quotes so an `exec 'q'`-style rendering still matches
+      local unquoted = token:gsub("^['\"]", ""):gsub("['\"]$", "")
+      if base(unquoted) == bin then
+        return true
+      end
+    end
+  end
+  return false
 end
 
 ---Extract the list of panes from a `pane list` response.
@@ -334,7 +399,11 @@ end
 ---Check whether the tool process actually runs inside the given pane (F2).
 ---`pane run` maps to input injection (no spawn), so a swallowed line leaves a
 ---live idle pane that looks started. Polling `pane process-info` and matching
----each foreground process with `tool:is_proc` is the only reliable signal.
+---each foreground process with `tool:is_proc` is the primary signal.
+---R15: a launch is also confirmed when the foreground entry matches the binary we
+---injected (`tool.cmd[1]`), so a working tool is not killed on an `is_proc`
+---false negative. This OR lives only here: discovery (`M.sessions()`) keeps
+---matching via `tool:is_proc` alone.
 ---@param pane_id string
 ---@return boolean
 function M:proc_running(pane_id)
@@ -344,8 +413,9 @@ function M:proc_running(pane_id)
   if type(info) ~= "table" then
     return false
   end
+  local bin = self.tool.cmd and self.tool.cmd[1]
   for _, entry in ipairs(info.foreground_processes or {}) do
-    if self.tool:is_proc(to_proc(info, entry)) then
+    if self.tool:is_proc(to_proc(info, entry)) or matches_injected(entry, bin) then
       return true
     end
   end
@@ -375,6 +445,14 @@ end
 ---confirmed via `pane process-info` before it counts as success (F2); on final
 ---failure the pane is closed, the cached identity is cleared and an error is
 ---reported.
+---R14: the retry re-injects unless a concrete change of foreground identity is
+---observed. A `wait_proc` false negative (transient `process-info` failure, or
+---`is_proc` not matching the tool) must not type a stray duplicate line into a
+---live TUI, so once both the pre-injection baseline and the current foreground
+---are concrete and differ, the remaining budget is spent polling instead of
+---re-running `pane run`. A `nil` snapshot (the pane has no foreground process
+---yet, or the probe soft-failed) proves nothing started, so re-injection is
+---still allowed (R14/F1).
 ---@param pane table pane with `pane_id` (or `id`) and `terminal_id`
 ---@return boolean
 function M:launch_pane(pane)
@@ -390,8 +468,17 @@ function M:launch_pane(pane)
     " "
   )
   local cmd = M.cmd(session, { "pane", "run", pane_id, "exec " .. tool_cmd }, current)
+  -- R14 baseline: what the pane's foreground looks like before any injection
+  local baseline = foreground_id(session, pane_id, current)
   for attempt = 1, LAUNCH_ATTEMPTS do
-    if Util.exec(cmd, { notify = false }) and self:wait_proc(pane_id) then
+    -- attempt 1 always injects; later attempts re-inject unless a concrete
+    -- change of foreground identity was observed since the baseline (R14/F1)
+    local cur = foreground_id(session, pane_id, current)
+    -- Discriminate only when both snapshots are concrete: `nil` means "no
+    -- foreground process yet" or a soft-failed probe, neither of which proves
+    -- the tool started, so the legacy re-inject is kept in that case (R14/F1).
+    local idle = attempt == 1 or cur == nil or baseline == nil or cur == baseline
+    if (not idle or Util.exec(cmd, { notify = false })) and self:wait_proc(pane_id) then
       self.herdr_pane_id = pane_id
       self.herdr_terminal_id = pane.terminal_id
       -- location is optional on create/split responses (D9 reveal); only
