@@ -7,6 +7,73 @@ local Util = require("sidekick.util")
 
 local M = {}
 
+---Cut `str` down to at most `max` display columns, keeping its prefix and
+---appending `…`. Wide (CJK) characters are never split in half.
+---@param str string
+---@param max integer
+---@return string
+local function truncate_head(str, max)
+  if max <= 0 then
+    return ""
+  end
+  local sw = vim.api.nvim_strwidth
+  if sw(str) <= max then
+    return str
+  end
+  max = max - 1 -- reserve one column for the ellipsis
+  local chars, len = {}, 0
+  for _, ch in ipairs(Util.split_chars(str)) do
+    local w = sw(ch)
+    if len + w > max then
+      break
+    end
+    chars[#chars + 1] = ch
+    len = len + w
+  end
+  return table.concat(chars) .. "…"
+end
+
+---Separator between the segments of a mux display label: `<ws> · <tab> · <pane>`.
+local SEP = " · "
+
+---Truncate a mux display label to at most `max` display columns, appending `…`
+---when it is cut; labels that already fit are returned untouched.
+---
+---The trailing segments carry the discriminator (the pane id), so a label that is
+---too long is shortened at its leading workspace segment while the ` · `
+---separators and the remaining segments stay intact:
+---`Alpha Site · 12 · p77` -> `Alpha Si… · 12 · p77`. Should the tail alone
+---overflow the budget, the next segment boundary is used instead, so the pane id
+---survives as long as it fits in `max - 4` columns. Only a label without a usable
+---boundary is cut from the end. Wide (CJK) characters are never split in half.
+---@param str string
+---@param max integer
+---@return string
+local function truncate(str, max)
+  if max <= 0 then
+    return ""
+  end
+  local sw = vim.api.nvim_strwidth
+  if sw(str) <= max then
+    return str
+  end
+  -- keep the longest trailing suffix that leaves room for a leading `…`
+  local from = 0
+  while true do
+    local i = str:find(SEP, from + 1, true)
+    if not i then
+      break
+    end
+    local head, tail = str:sub(1, i - 1), str:sub(i + #SEP)
+    local head_max = max - sw(SEP) - sw(tail)
+    if head_max >= 1 then
+      return truncate_head(head, head_max) .. SEP .. tail
+    end
+    from = i
+  end
+  return truncate_head(str, max)
+end
+
 ---@param opts sidekick.cli.Select
 function M.select(opts)
   assert(type(opts) == "table", "opts must be a table")
@@ -96,12 +163,27 @@ function M.format(state, picker)
     -- Keep this for debugging purposes
     -- ret[#ret + 1] = { table.concat(state.session.pids or {}, ",") }
 
-    local backends = {} ---@type string[]
-    backends[#backends + 1] = state.session.mux_backend or state.session.backend
-    if state.external then
-      backends[#backends + 1] = state.session.mux_session
+    -- mux token: `[<backend>:<session>]`. Backends that expose a display label
+    -- (herdr panes) show the label in place of the session name, truncated so the
+    -- right-aligned cwd column below stays put. Sessions without the label render
+    -- exactly as before.
+    local base = state.session.mux_backend or state.session.backend
+    local backend
+    local label = state.external and state.session.mux_label or nil
+    if type(label) == "string" and label ~= "" then
+      -- 40 (cwd column) - 12 (fixed tool/icon prefix, see above) - 1 (closing `]`)
+      -- minus the `[<base>:` prefix; a token of exactly 28 columns still lands the
+      -- cwd on the same column as every other row (padding becomes 0)
+      local budget = 28 - sw(("[" .. base .. ":")) - 1
+      backend = ("[%s:%s]"):format(base, truncate(label, budget))
+    else
+      local backends = {} ---@type string[]
+      backends[#backends + 1] = base
+      if state.external then
+        backends[#backends + 1] = state.session.mux_session
+      end
+      backend = ("[%s]"):format(table.concat(backends, ":"))
     end
-    local backend = ("[%s]"):format(table.concat(backends, ":"))
 
     ret[#ret + 1] = { backend, "Special" }
     len = 12 + sw(backend)

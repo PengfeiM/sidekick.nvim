@@ -278,6 +278,108 @@ local function panes(ret)
   return {}
 end
 
+---Build the per-source `workspace_id -> label` / `tab_id -> number` lookup used
+---to compose the picker `mux_label`. One session-scoped `api snapshot` call per
+---source (memoized by the caller), since `pane list` carries ids only.
+---Never raises: an absent/failed/unexpected payload yields empty tables, so the
+---label degrades to ids instead of erroring.
+---@param source sidekick.cli.session.HerdrSource
+---@return { workspaces: table<string,string>, tabs: table<string,integer> }
+local function snapshot_labels(source)
+  ---@type { workspaces: table<string,string>, tabs: table<string,integer> }
+  local lookup = { workspaces = {}, tabs = {} }
+  local ret = M.json(M.cmd(source.name, { "api", "snapshot" }, source.current))
+  local snapshot = type(ret) == "table" and ret.snapshot or nil
+  if type(snapshot) ~= "table" then
+    return lookup
+  end
+  -- sections are optional and must never raise: a scalar (or otherwise
+  -- non-list) section degrades to "no names", not to a crash inside discovery
+  local workspaces = snapshot.workspaces
+  if type(workspaces) ~= "table" then
+    workspaces = {}
+  end
+  local tabs = snapshot.tabs
+  if type(tabs) ~= "table" then
+    tabs = {}
+  end
+  for _, ws in ipairs(workspaces) do
+    if type(ws) == "table" and type(ws.workspace_id) == "string" and type(ws.label) == "string" and ws.label ~= "" then
+      lookup.workspaces[ws.workspace_id] = ws.label
+    end
+  end
+  for _, tab in ipairs(tabs) do
+    if type(tab) == "table" and type(tab.tab_id) == "string" and type(tab.label) == "string" then
+      -- `tab.number` is a session-wide monotonic id counter (measured: 28/31/83/90),
+      -- not the index herdr shows. The displayed index is the leading integer of
+      -- the tab label (`"2 · sidekick.nvim › dev/herdr"` -> 2); when it cannot be
+      -- parsed the label degrades to the stripped tab id instead.
+      local index = tonumber(tab.label:match("^(%d+)"))
+      if index then
+        lookup.tabs[tab.tab_id] = index
+      end
+    end
+  end
+  return lookup
+end
+
+---Strip a leading `"<workspace_id>:"` prefix from an id.
+---Falls back to stripping any `<token>:` prefix when the workspace id is unknown.
+---@param id string
+---@param workspace_id? string
+---@return string
+local function strip_workspace(id, workspace_id)
+  if type(workspace_id) == "string" and workspace_id ~= "" then
+    local prefix = workspace_id .. ":"
+    if id:sub(1, #prefix) == prefix then
+      return id:sub(#prefix + 1)
+    end
+  end
+  return id:match("^[^:]+:(.+)$") or id
+end
+
+---Compose the picker `mux_label` (`workspace · tab · pane`) for a pane.
+---Segments degrade to ids (never status words/glyphs); nil/empty segments are
+---dropped, and a missing pane id yields `nil` so the UI keeps `[herdr:<session>]`.
+---@param pane table a `pane list` record
+---@param lookup { workspaces: table<string,string>, tabs: table<string,integer> }
+---@return string?
+local function compose_mux_label(pane, lookup)
+  local pane_id = pane.pane_id or pane.id
+  if type(pane_id) ~= "string" or pane_id == "" then
+    return nil
+  end
+  local workspace_id = pane.workspace_id or pane_id:match("^([^:]+):")
+  local segments = {} ---@type string[]
+
+  local workspace = workspace_id and lookup.workspaces[workspace_id] or nil
+  if type(workspace) ~= "string" or workspace == "" then
+    workspace = workspace_id
+  end
+  if type(workspace) == "string" and workspace ~= "" then
+    segments[#segments + 1] = workspace
+  end
+
+  local tab_id = pane.tab_id
+  if type(tab_id) == "string" and tab_id ~= "" then
+    local number = lookup.tabs[tab_id]
+    local tab = number ~= nil and tostring(number) or strip_workspace(tab_id, workspace_id)
+    if tab ~= "" then
+      segments[#segments + 1] = tab
+    end
+  end
+
+  local pane_segment = strip_workspace(pane_id, workspace_id)
+  if pane_segment ~= "" then
+    segments[#segments + 1] = pane_segment
+  end
+
+  if #segments == 0 then
+    return nil
+  end
+  return table.concat(segments, " · ")
+end
+
 ---Resolve the herdr pane backing this session.
 ---Runs `pane list` (session scoped via the global `--session`, since `pane list`
 ---only accepts `--workspace`) and matches by `terminal_id`, falling back to
@@ -625,10 +727,17 @@ function M.sessions()
   -- memoized per call so discovery is O(sources + panes), not O(sources * panes)
   local pane_cache = {} ---@type table<string, table[]>
   local proc_cache = {} ---@type table<string, table|false>
+  -- at most one `api snapshot` lookup per source, reused by all its panes
+  local label_cache = {} ---@type table<string, { workspaces: table<string,string>, tabs: table<string,integer> }>
   local failed = 0
 
   for _, source in ipairs(M.sources()) do
     local skey = source.name or "\0current"
+    local lookup = label_cache[skey]
+    if not lookup then
+      lookup = snapshot_labels(source)
+      label_cache[skey] = lookup
+    end
     local pane_list = pane_cache[skey]
     if not pane_list then
       local list = M.json(M.cmd(source.name, { "pane", "list" }, source.current))
@@ -685,6 +794,7 @@ function M.sessions()
                 herdr_session = source.name,
                 herdr_current = source.current,
                 mux_session = source.name,
+                mux_label = compose_mux_label(pane, lookup),
                 pids = {},
               }
               by_id[id] = state

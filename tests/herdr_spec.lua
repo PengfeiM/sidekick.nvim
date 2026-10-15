@@ -118,6 +118,27 @@ end
 local TOOL_PANE = '{"id":"1","result":{"panes":[{"pane_id":"w1:p1","terminal_id":"t1",'
   .. '"workspace_id":"w1","tab_id":"w1:t1","cwd":"/tmp/cwd","foreground_cwd":"/tmp/cwd"}]}}'
 
+---`api snapshot` payload: workspace `w7` labelled `Alpha Site`, tab `w7:t2T`
+---labelled `2 · …`. The tab's `number` is deliberately the session-wide counter
+---(90) rather than the displayed index, so the fixture fails if `number` is used.
+local SNAPSHOT = '{"id":"1","result":{"snapshot":{'
+  .. '"workspaces":[{"workspace_id":"w7","label":"Alpha Site","number":1,"active_tab_id":"w7:t2T"}],'
+  .. '"tabs":[{"tab_id":"w7:t2T","workspace_id":"w7","number":90,"label":"2 · sidekick.nvim › dev/herdr"}]}}}'
+
+---`pane list` payload for workspace `w7`, tab `w7:t2T`, pane `w7:p77`.
+---The pane carries a `label` (real `pane list` always does) that must **not** be
+---used for the composed label — the pane id is the identity (they differ).
+local PANE_W7 = '{"id":"1","result":{"panes":[{"pane_id":"w7:p77","terminal_id":"t77",'
+  .. '"workspace_id":"w7","tab_id":"w7:t2T","label":"sidekick.nvim › dev/herdr",'
+  .. '"cwd":"/tmp/cwd","foreground_cwd":"/tmp/cwd"}]}}'
+
+---Two panes sharing workspace+tab+cwd **and** name (a real collision: one tab
+---holding two panes both labelled `demo-repo › feat/1.2.3`), so only the pane id
+---separates them — the exact collision the `mux_label` was added to resolve.
+local PANE_W7_TWO = '{"id":"1","result":{"panes":['
+  .. '{"pane_id":"w7:p76","terminal_id":"t76","workspace_id":"w7","tab_id":"w7:t2T","label":"demo-repo › feat/1.2.3","cwd":"/tmp/cwd","foreground_cwd":"/tmp/cwd"},'
+  .. '{"pane_id":"w7:p77","terminal_id":"t77","workspace_id":"w7","tab_id":"w7:t2T","label":"demo-repo › feat/1.2.3","cwd":"/tmp/cwd","foreground_cwd":"/tmp/cwd"}]}}'
+
 ---Stub `Util.exec` with a per-command handler, recording every argv.
 ---The handler returns stdout (success) or `nil` (failure).
 ---@param handler fun(cmd:string[]):string?
@@ -165,6 +186,26 @@ local function stub_current_discovery(sessions)
       return TOOL_PROC
     end
     return TOOL_PANE
+  end)
+end
+
+---Stub a named `work` source whose single `w7:p77` pane matches the fake tool,
+---answering the `api snapshot` probe with `snapshot` (`nil` simulates failure).
+---@param snapshot string? raw snapshot payload
+---@return string[][]
+local function stub_w7_discovery(snapshot)
+  Config.tools = function()
+    return { tool = fake_tool("tool") }
+  end
+  return stub_herdr(function(cmd)
+    if vim.tbl_contains(cmd, "snapshot") then
+      return snapshot
+    elseif vim.tbl_contains(cmd, "session") then
+      return '{"sessions":[{"name":"work","running":true,"default":true}]}'
+    elseif vim.tbl_contains(cmd, "process-info") then
+      return TOOL_PROC
+    end
+    return PANE_W7
   end)
 end
 
@@ -639,9 +680,12 @@ describe("herdr backend", function()
       Config.tools = function()
         return { tool = fake_tool("tool") }
       end
-      local counts = { session = 0, pane_list = 0, process = 0 }
+      local counts = { session = 0, snapshot = 0, pane_list = 0, process = 0 }
       stub_herdr(function(cmd)
-        if vim.tbl_contains(cmd, "session") then
+        if vim.tbl_contains(cmd, "snapshot") then
+          counts.snapshot = counts.snapshot + 1
+          return SNAPSHOT
+        elseif vim.tbl_contains(cmd, "session") then
           counts.session = counts.session + 1
           return '{"sessions":[{"name":"work","running":true,"default":true}]}'
         elseif vim.tbl_contains(cmd, "process-info") then
@@ -656,6 +700,8 @@ describe("herdr backend", function()
       local ret = Herdr.sessions()
       assert.are.equal(2, #ret)
       assert.are.equal(1, counts.session)
+      -- the display-label lookup is one `api snapshot` per source, not per pane
+      assert.are.equal(1, counts.snapshot)
       assert.are.equal(1, counts.pane_list)
       assert.are.equal(2, counts.process)
     end)
@@ -698,6 +744,149 @@ describe("herdr backend", function()
         return TOOL_PANE
       end)
       assert.are.same({}, Herdr.sessions())
+    end)
+  end)
+
+  describe("mux_label (picker display label)", function()
+    it("composes the workspace label, tab number and pane id (named source)", function()
+      local calls = stub_w7_discovery(SNAPSHOT)
+      local ret = Herdr.sessions()
+      assert.are.equal(1, #ret)
+      assert.are.equal("Alpha Site · 2 · p77", ret[1].mux_label)
+      -- the extra lookup is session-scoped like every other command
+      assert.are.same({ "herdr", "--session", "work", "api", "snapshot" }, find_call(calls, { "api", "snapshot" }))
+    end)
+
+    it("omits --session for the current source", function()
+      vim.env.HERDR_ENV = "1"
+      local calls = stub_herdr(function(cmd)
+        if vim.tbl_contains(cmd, "snapshot") then
+          return SNAPSHOT
+        elseif vim.tbl_contains(cmd, "session") then
+          return '{"sessions":[{"name":"default","running":true,"default":true}]}'
+        elseif vim.tbl_contains(cmd, "process-info") then
+          return TOOL_PROC
+        end
+        return PANE_W7
+      end)
+      Config.tools = function()
+        return { tool = fake_tool("tool") }
+      end
+      local ret = Herdr.sessions()
+      assert.are.equal(1, #ret)
+      assert.are.equal("Alpha Site · 2 · p77", ret[1].mux_label)
+      assert.are.same({ "herdr", "api", "snapshot" }, find_call(calls, { "api", "snapshot" }))
+    end)
+
+    it("distinguishes two panes sharing workspace, tab and cwd", function()
+      local calls = stub_herdr(function(cmd)
+        if vim.tbl_contains(cmd, "snapshot") then
+          return SNAPSHOT
+        elseif vim.tbl_contains(cmd, "session") then
+          return '{"sessions":[{"name":"work","running":true,"default":true}]}'
+        elseif vim.tbl_contains(cmd, "process-info") then
+          return TOOL_PROC
+        end
+        return PANE_W7_TWO
+      end)
+      Config.tools = function()
+        return { tool = fake_tool("tool") }
+      end
+      local ret = Herdr.sessions()
+      assert.are.equal(2, #ret)
+      assert.are.equal(ret[1].cwd, ret[2].cwd)
+      local labels = { ret[1].mux_label, ret[2].mux_label }
+      table.sort(labels)
+      assert.are.same({ "Alpha Site · 2 · p76", "Alpha Site · 2 · p77" }, labels)
+      assert.are.equal(1, #vim.tbl_filter(function(cmd)
+        return vim.tbl_contains(cmd, "snapshot")
+      end, calls))
+    end)
+
+    it("falls back to ids when the snapshot probe fails", function()
+      stub_w7_discovery(nil)
+      local ret = Herdr.sessions()
+      assert.are.equal(1, #ret)
+      assert.are.equal("w7 · t2T · p77", ret[1].mux_label)
+    end)
+
+    it("falls back to ids when the snapshot payload is unexpected", function()
+      stub_w7_discovery('{"id":"1","result":{"snapshot":{"workspaces":[],"tabs":[]}}}')
+      local ret = Herdr.sessions()
+      assert.are.equal(1, #ret)
+      assert.are.equal("w7 · t2T · p77", ret[1].mux_label)
+    end)
+
+    it("never raises when a snapshot section is not a list", function()
+      -- a scalar section used to hit `ipairs` and abort the whole picker
+      stub_w7_discovery('{"id":"1","result":{"snapshot":{"workspaces":"oops","tabs":42}}}')
+      local ret = Herdr.sessions()
+      assert.are.equal(1, #ret)
+      assert.are.equal("w7 · t2T · p77", ret[1].mux_label)
+    end)
+
+    it("degrades per segment when the snapshot omits an entity", function()
+      -- workspace label missing, tab display index still parseable from the label
+      stub_w7_discovery(
+        '{"id":"1","result":{"snapshot":{"workspaces":[{"workspace_id":"w7","label":""}],'
+          .. '"tabs":[{"tab_id":"w7:t2T","number":90,"label":"2 · sidekick.nvim"}]}}}'
+      )
+      local ret = Herdr.sessions()
+      assert.are.equal(1, #ret)
+      assert.are.equal("w7 · 2 · p77", ret[1].mux_label)
+    end)
+
+    it("degrades to the tab id when the tab label carries no index", function()
+      stub_w7_discovery(
+        '{"id":"1","result":{"snapshot":{"workspaces":[{"workspace_id":"w7","label":"Alpha Site"}],'
+          .. '"tabs":[{"tab_id":"w7:t2T","number":90,"label":"sidekick.nvim"}]}}}'
+      )
+      local ret = Herdr.sessions()
+      assert.are.equal(1, #ret)
+      assert.are.equal("Alpha Site · t2T · p77", ret[1].mux_label)
+    end)
+
+    it("omits the tab segment when the pane reports no tab id", function()
+      local pane = '{"id":"1","result":{"panes":[{"pane_id":"w7:p77","terminal_id":"t77",'
+        .. '"workspace_id":"w7","cwd":"/tmp/cwd","foreground_cwd":"/tmp/cwd"}]}}'
+      stub_herdr(function(cmd)
+        if vim.tbl_contains(cmd, "snapshot") then
+          return SNAPSHOT
+        elseif vim.tbl_contains(cmd, "session") then
+          return '{"sessions":[{"name":"work","running":true,"default":true}]}'
+        elseif vim.tbl_contains(cmd, "process-info") then
+          return TOOL_PROC
+        end
+        return pane
+      end)
+      Config.tools = function()
+        return { tool = fake_tool("tool") }
+      end
+      local ret = Herdr.sessions()
+      assert.are.equal(1, #ret)
+      assert.are.equal("Alpha Site · p77", ret[1].mux_label)
+    end)
+
+    it("leaves mux_label unset when the pane carries no id", function()
+      local pane = '{"id":"1","result":{"panes":[{"pane_id":"","terminal_id":"t9",'
+        .. '"workspace_id":"w7","tab_id":"w7:t2T","cwd":"/tmp/cwd","foreground_cwd":"/tmp/cwd"}]}}'
+      stub_herdr(function(cmd)
+        if vim.tbl_contains(cmd, "snapshot") then
+          return SNAPSHOT
+        elseif vim.tbl_contains(cmd, "session") then
+          return '{"sessions":[{"name":"work","running":true,"default":true}]}'
+        elseif vim.tbl_contains(cmd, "process-info") then
+          return TOOL_PROC
+        end
+        return pane
+      end)
+      Config.tools = function()
+        return { tool = fake_tool("tool") }
+      end
+      local ret = Herdr.sessions()
+      assert.are.equal(1, #ret)
+      -- the UI then keeps rendering `[herdr:<session>]`
+      assert.is_nil(ret[1].mux_label)
     end)
   end)
 

@@ -18,6 +18,7 @@ M._attached = {} ---@type table<string,sidekick.cli.Session>
 ---@field parent? sidekick.cli.Session
 ---@field mux_session? string
 ---@field mux_backend? string
+---@field mux_label? string spatial display label (`workspace · tab · pane`); shown instead of `mux_session` when set
 
 ---@alias sidekick.cli.session.Opts sidekick.cli.session.State|{cwd?:string,id?:string}
 
