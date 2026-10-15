@@ -13,6 +13,30 @@ M.external = false
 ---Maximum length of a sanitized herdr session name.
 local MAX_SESSION_NAME = 64
 
+---Warn-once bookkeeping, keyed by `sid` and concern (D6/D5/D12).
+---Module-level so it survives session instances: P3 discovery creates a fresh
+---instance per session, and per-instance flags would re-arm the warning for the
+---same session on every discovery pass (F4).
+---@type table<string, table<string, boolean>>
+M._warned = {}
+
+---Record and report the first time `key` is seen for `sid`.
+---@param sid string
+---@param key string
+---@return boolean true only the first time
+local function warn_once(sid, key)
+  local per = M._warned[sid]
+  if not per then
+    per = {}
+    M._warned[sid] = per
+  end
+  if per[key] then
+    return false
+  end
+  per[key] = true
+  return true
+end
+
 ---Resolve the herdr binary.
 ---Prefers `$HERDR_BIN_PATH` (the official convention when running inside herdr)
 ---and falls back to `herdr` on `$PATH` (D17).
@@ -135,6 +159,215 @@ function M.ensure_server(session, current)
   return true
 end
 
+---Maximum number of `pane run` attempts before giving up (macOS may reject
+---an oversized line and a fresh pane's shell may not be ready yet; F2).
+local LAUNCH_ATTEMPTS = 3
+---Delay between `pane run` attempts, in milliseconds.
+local LAUNCH_RETRY_DELAY = 100
+---Number of `pane process-info` polls per attempt used to confirm the tool
+---process actually came up after `pane run` (F2).
+local PROC_POLLS = 5
+---Delay between `pane process-info` polls, in milliseconds.
+---Worst case per launch: 3 x (5 polls x 100ms) + 2 x 100ms retry ≈ 1.4s (≲3s).
+local PROC_POLL_INTERVAL = 100
+
+---Build a `Proc`-shaped table from a `process-info` foreground entry (D19).
+---The command chain mirrors D19: `cmdline -> argv joined -> argv0 -> name`.
+---@param info table `process_info` payload (carries `shell_pid`)
+---@param entry table foreground process entry
+---@return sidekick.cli.Proc
+local function to_proc(info, entry)
+  local cmd = entry.cmdline
+  if (cmd == nil or cmd == "") and type(entry.argv) == "table" then
+    cmd = table.concat(entry.argv, " ")
+  end
+  if cmd == nil or cmd == "" then
+    cmd = entry.argv0 or entry.name
+  end
+  return {
+    pid = entry.pid,
+    ppid = info.shell_pid,
+    cmd = cmd,
+    cwd = entry.cwd,
+  }
+end
+
+---Extract the list of panes from a `pane list` response.
+---Tolerates the wrapped `{ result = { panes = ... } }` shape as well as a bare
+---list. Returns an empty list when the payload is missing or unexpected.
+---@param ret table?
+---@return table[]
+local function panes(ret)
+  if type(ret) ~= "table" then
+    return {}
+  end
+  if type(ret.panes) == "table" then
+    return ret.panes
+  end
+  if ret[1] ~= nil then
+    return ret
+  end
+  return {}
+end
+
+---Resolve the herdr pane backing this session.
+---Runs `pane list` (session scoped via the global `--session`, since `pane list`
+---only accepts `--workspace`) and matches by `terminal_id`, falling back to
+---`pane_id`. The resolved ids are cached back onto `self`.
+---With `refresh = true` the cache is bypassed and `pane list` is re-queried, so
+---a stale cache can never make a dead session look alive. A lookup that finds no
+---matching pane invalidates both cached ids (D18).
+---@param refresh? boolean bypass the cache and re-query `pane list`
+---@return table?
+function M:pane(refresh)
+  if not refresh and self.herdr_pane_id and self.herdr_terminal_id then
+    return { pane_id = self.herdr_pane_id, terminal_id = self.herdr_terminal_id }
+  end
+  if not self.external and not self.herdr_session then
+    return nil
+  end
+  local ret = M.json(M.cmd(self.herdr_session, { "pane", "list" }, self.external == true))
+  local match ---@type table?
+  for _, pane in ipairs(panes(ret)) do
+    local pane_id = pane.pane_id or pane.id
+    if self.herdr_terminal_id and pane.terminal_id == self.herdr_terminal_id then
+      match = pane
+      break
+    end
+    if self.herdr_pane_id and pane_id == self.herdr_pane_id then
+      match = match or pane
+    end
+  end
+  if match then
+    self.herdr_pane_id = match.pane_id or match.id
+    self.herdr_terminal_id = match.terminal_id
+    return match
+  end
+  -- D18: a failed lookup invalidates the cached identity so `is_running()`
+  -- can transition to false instead of reporting a stale pane forever.
+  self.herdr_pane_id = nil
+  self.herdr_terminal_id = nil
+  return nil
+end
+
+---Resolve the herdr pane id backing this session.
+---@return string?
+function M:pane_id()
+  if self.herdr_pane_id then
+    return self.herdr_pane_id
+  end
+  local pane = self:pane()
+  return pane and (pane.pane_id or pane.id) or nil
+end
+
+---Warn once per session when an embedded terminal would nest inside herdr (D6).
+---Never rewrites the user's configuration.
+function M:nested_warn()
+  if vim.env.HERDR_ENV == "1" and Config.cli.mux.create == "terminal" then
+    if warn_once(self.sid, "nested") then
+      Util.warn({
+        "herdr: starting an embedded terminal from inside herdr creates a nested session.",
+        'Consider setting `opts.cli.mux.create` to `"split"` or `"window"`.',
+      })
+    end
+  end
+end
+
+---Append `--env K=V` for every entry in `tool.env` (D5).
+---herdr cannot unset variables, so `false` values are skipped and a single
+---warning per session is emitted to make the ignored unset explicit.
+---@param cmd string[]
+function M:add_env(cmd)
+  for key, value in pairs(self.tool.env or {}) do
+    if value == false then
+      if warn_once(self.sid, "env") then
+        Util.warn(
+          ("herdr cannot unset environment variables; ignoring `%s=false` for **%s**"):format(key, self.tool.name)
+        )
+      end
+    else
+      vim.list_extend(cmd, { "--env", ("%s=%s"):format(key, tostring(value)) })
+    end
+  end
+end
+
+---Check whether the tool process actually runs inside the given pane (F2).
+---`pane run` maps to input injection (no spawn), so a swallowed line leaves a
+---live idle pane that looks started. Polling `pane process-info` and matching
+---each foreground process with `tool:is_proc` is the only reliable signal.
+---@param pane_id string
+---@return boolean
+function M:proc_running(pane_id)
+  local ret = M.json(M.cmd(self.herdr_session, { "pane", "process-info", "--pane", pane_id }, self.external == true))
+  local info = type(ret) == "table" and ret.process_info or nil
+  if type(info) ~= "table" then
+    return false
+  end
+  for _, entry in ipairs(info.foreground_processes or {}) do
+    if self.tool:is_proc(to_proc(info, entry)) then
+      return true
+    end
+  end
+  return false
+end
+
+---Poll `pane process-info` a bounded number of times, waiting for the tool
+---process to appear (F2). Returns as soon as it is observed.
+---@param pane_id string
+---@return boolean
+function M:wait_proc(pane_id)
+  for poll = 1, PROC_POLLS do
+    if self:proc_running(pane_id) then
+      return true
+    end
+    if poll < PROC_POLLS then
+      vim.wait(PROC_POLL_INTERVAL)
+    end
+  end
+  return false
+end
+
+---Start the tool inside an existing (or freshly created) pane (D4).
+---Uses `pane run <pane> "exec <cmd>"`, retrying a bounded number of times
+---because a fresh pane's shell may not be ready yet and macOS can reject an
+---oversized line (D11). Because `pane run` only injects input, each attempt is
+---confirmed via `pane process-info` before it counts as success (F2); on final
+---failure the pane is closed, the cached identity is cleared and an error is
+---reported.
+---@param pane table pane with `pane_id` (or `id`) and `terminal_id`
+---@return boolean
+function M:launch_pane(pane)
+  local pane_id = pane.pane_id or pane.id
+  if not pane_id then
+    return false
+  end
+  local session, current = self.herdr_session, self.external == true
+  local tool_cmd = table.concat(
+    vim.tbl_map(function(a)
+      return vim.fn.shellescape(a)
+    end, self.tool.cmd),
+    " "
+  )
+  local cmd = M.cmd(session, { "pane", "run", pane_id, "exec " .. tool_cmd }, current)
+  for attempt = 1, LAUNCH_ATTEMPTS do
+    if Util.exec(cmd, { notify = false }) and self:wait_proc(pane_id) then
+      self.herdr_pane_id = pane_id
+      self.herdr_terminal_id = pane.terminal_id
+      self.started = true
+      return true
+    end
+    if attempt < LAUNCH_ATTEMPTS then
+      vim.wait(LAUNCH_RETRY_DELAY)
+    end
+  end
+  self.started = nil
+  self.herdr_pane_id = nil
+  self.herdr_terminal_id = nil
+  Util.exec(M.cmd(session, { "pane", "close", pane_id }, current), { notify = false })
+  Util.error(("Failed to start **%s** in herdr pane `%s`"):format(self.tool.name, pane_id))
+  return false
+end
+
 ---Initialize the session backend.
 ---Mirrors the tmux semantics (D14). The sanitized name is stored in
 ---`self.herdr_session` and is *never* written to `self.mux_session`,
@@ -148,6 +381,7 @@ function M:init()
   end
   self.herdr_session = M.session_name(self.sid)
   self.priority = self.external and 10 or 50
+  self:nested_warn()
 end
 
 ---List all active sessions for this backend (discovery: P3).
@@ -158,28 +392,156 @@ end
 
 ---Start a new session (creation: P2).
 ---@return sidekick.cli.terminal.Cmd?
-function M:start() end
+function M:start()
+  self:nested_warn()
+  local current = self.external == true
+  if not self.external then
+    if not M.ensure_server(self.herdr_session, current) then
+      return nil
+    end
+    local cmd = M.cmd(self.herdr_session, {
+      "workspace",
+      "create",
+      "--cwd",
+      self.cwd,
+      "--label",
+      self.sid,
+      "--no-focus",
+    }, current)
+    self:add_env(cmd)
+    local ret = M.json(cmd, { notify = true })
+    local pane = ret and ret.root_pane
+    if not pane or not self:launch_pane(pane) then
+      return nil
+    end
+    return {
+      cmd = { M.bin(), "--session", self.herdr_session, "terminal", "attach", self.herdr_terminal_id },
+    }
+  elseif Config.cli.mux.create == "window" then
+    local args = { "tab", "create" }
+    if vim.env.HERDR_WORKSPACE_ID then
+      vim.list_extend(args, { "--workspace", vim.env.HERDR_WORKSPACE_ID })
+    end
+    vim.list_extend(args, { "--cwd", self.cwd, "--label", self.sid, "--no-focus" })
+    self:add_env(args)
+    local ret = M.json(M.cmd(self.herdr_session, args, current), { notify = true })
+    local pane = ret and ret.root_pane
+    if not pane or not self:launch_pane(pane) then
+      return nil
+    end
+    Util.info(("Started **%s** in a new herdr window"):format(self.tool.name))
+  elseif Config.cli.mux.create == "split" then
+    local args = {
+      "pane",
+      "split",
+      "--current",
+      "--direction",
+      Config.cli.mux.split.vertical and "right" or "down",
+      "--cwd",
+      self.cwd,
+      "--no-focus",
+    }
+    local size = Config.cli.mux.split.size
+    if size then
+      vim.list_extend(args, { "--ratio", tostring(1 - size) })
+    end
+    self:add_env(args)
+    local ret = M.json(M.cmd(self.herdr_session, args, current), { notify = true })
+    local pane = ret and ret.pane
+    if not pane or not self:launch_pane(pane) then
+      return nil
+    end
+    Util.info(("Started **%s** in a new herdr split"):format(self.tool.name))
+  end
+end
 
----Attach to an existing session (attach: P2).
+---Attach to an existing session.
+---Embedded sessions attach to their pane via `terminal attach` (Linux/macOS
+---only). External sessions run in a herdr-managed pane and are not attached
+---from Neovim (D12).
 ---@return sidekick.cli.terminal.Cmd?
-function M:attach() end
+function M:attach()
+  if self.external then
+    return nil
+  end
+  if vim.fn.has("win32") == 1 then
+    if warn_once(self.sid, "win") then
+      Util.warn("herdr `terminal attach` is only supported on Linux/macOS; not attaching on Windows.")
+    end
+    return nil
+  end
+  local terminal_id = self.herdr_terminal_id
+  if not terminal_id then
+    local pane = self:pane()
+    terminal_id = pane and pane.terminal_id
+  end
+  if not terminal_id then
+    return nil
+  end
+  return { cmd = { M.bin(), "--session", self.herdr_session, "terminal", "attach", terminal_id } }
+end
 
----Send text to the session (P2).
+---Send text to the session's pane (`pane send-text`).
+---Mirrors tmux's `mux_focus` handling: some TUIs ignore input while unfocused,
+---so a focus-in escape is sent first and the actual text follows after a short
+---delay.
 ---@param text string
-function M:send(text) end
+function M:send(text)
+  local pane_id = self:pane_id()
+  if not pane_id then
+    return
+  end
+  local session, current = self.herdr_session, self.external == true
+  local function send()
+    Util.exec(M.cmd(session, { "pane", "send-text", pane_id, text }, current), { notify = true })
+  end
+  if self.tool.mux_focus then
+    Util.exec(M.cmd(session, { "pane", "send-keys", pane_id, "Escape", "[", "I" }, current), { notify = true })
+    vim.defer_fn(send, 50)
+  else
+    send()
+  end
+end
 
----Submit the current input to the session (P2).
-function M:submit() end
+---Submit the current input to the session's pane (`pane send-keys <pane> Enter`).
+function M:submit()
+  local pane_id = self:pane_id()
+  if not pane_id then
+    return
+  end
+  local session, current = self.herdr_session, self.external == true
+  Util.exec(M.cmd(session, { "pane", "send-keys", pane_id, "Enter" }, current), { notify = true })
+end
 
----Dump the session scrollback (P2).
+---Dump the session scrollback.
+---Returns the raw stdout of `pane read --ansi` (D10), never parsed JSON.
 ---@return string?
-function M:dump() end
+function M:dump()
+  local pane_id = self:pane_id()
+  if not pane_id then
+    return
+  end
+  local session, current = self.herdr_session, self.external == true
+  local args = {
+    "pane",
+    "read",
+    pane_id,
+    "--source",
+    "recent-unwrapped",
+    "--lines",
+    tostring(Config.cli.mux.dump),
+    "--ansi",
+  }
+  local _, stdout = Util.exec(M.cmd(session, args, current), { notify = true })
+  return stdout
+end
 
 ---Check if the session is still running.
----Discovery is not implemented yet, so this honestly reports `false`.
+---Refreshes the pane lookup (bypassing the cache) so a dead session reports
+---`false` and the cached identity is invalidated (D18).
 ---@return boolean
 function M:is_running()
-  return false
+  return self:pane(true) ~= nil
 end
 
 return M
